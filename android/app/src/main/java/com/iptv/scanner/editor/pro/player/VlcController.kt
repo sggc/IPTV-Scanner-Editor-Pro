@@ -50,8 +50,12 @@ class VlcController(context: Context) : Player, MediaPlayer.EventListener {
     // -----------------------------------------------------------------
 
     /**
-     * LibVLC 实例（全局选项：RTSP-TCP / 网络缓存 / 硬解码 / 全屏）。
+     * LibVLC 实例（全局选项：RTSP-TCP / 网络缓存 / 硬解码 / 全屏 / HDR）。
      * 在构造函数中创建，在 [detach] 中释放。
+     *
+     * HDR 选项说明：
+     * - `--hdr-process-gpu`：在 GPU 上处理 HDR 内容（直通到 Surface，由系统 HDR 显示管线处理）
+     * - 若设备不支持 HDR 显示，MediaCodec 解码的 HDR 内容会被系统自动压缩到 SDR
      */
     private val libVLC: LibVLC = LibVLC(
         context,
@@ -62,7 +66,8 @@ class VlcController(context: Context) : Player, MediaPlayer.EventListener {
             "--codec=mediacodec_ndk",   // 硬件解码（MediaCodec NDK 接口）
             "--fullscreen",             // 全屏渲染
             "--no-drop-late-frames",    // 不丢弃迟到帧（减少画面跳跃）
-            "--no-skip-frames"          // 不跳帧（保证画面连续性）
+            "--no-skip-frames",         // 不跳帧（保证画面连续性）
+            "--hdr-process-gpu"         // HDR GPU 处理（直通，由系统显示管线处理）
         )
     )
 
@@ -619,6 +624,145 @@ class VlcController(context: Context) : Player, MediaPlayer.EventListener {
     }
 
     // -----------------------------------------------------------------
+    // mpv 兼容属性读取（让 StreamQualityPanel 能显示 VLC 的媒体信息）
+    //
+    // VLC 通过 IMedia.Track 获取编解码器、分辨率、帧率、码率等信息，
+    // 映射到 mpv 属性名供 UI 复用。
+    // -----------------------------------------------------------------
+
+    /** 缓存当前视频/音频轨道信息（onPlaying 事件触发时更新） */
+    @Volatile
+    private var cachedVideoTrack: IMedia.VideoTrack? = null
+    @Volatile
+    private var cachedAudioTrack: IMedia.AudioTrack? = null
+    @Volatile
+    private var cachedVideoCodec: String? = null
+    @Volatile
+    private var cachedAudioCodec: String? = null
+
+    /** 从 media 解析轨道并缓存（onPlaying 时调用） */
+    private fun refreshCachedTracks() {
+        try {
+            val media = mediaPlayer.media ?: return
+            cachedVideoTrack = null
+            cachedAudioTrack = null
+            cachedVideoCodec = null
+            cachedAudioCodec = null
+            for (i in 0 until media.trackCount) {
+                val track = media.getTrack(i) ?: continue
+                when (track.type) {
+                    IMedia.Track.Type.Video -> {
+                        cachedVideoTrack = track as? IMedia.VideoTrack
+                        cachedVideoCodec = track.codec?.takeIf { it.isNotEmpty() }
+                    }
+                    IMedia.Track.Type.Audio -> {
+                        cachedAudioTrack = track as? IMedia.AudioTrack
+                        cachedAudioCodec = track.codec?.takeIf { it.isNotEmpty() }
+                    }
+                    else -> {}
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "refreshCachedTracks failed: ${e.message}")
+        }
+    }
+
+    override fun getPropertyString(name: String): String? = when (name) {
+        "video-codec", "video-format" -> cachedVideoCodec
+        "audio-codec", "audio-codec-name" -> cachedAudioCodec
+        "vo" -> "vlc"
+        "hwdec-current" -> if (hardwareDecode) "mediacodec_ndk" else "off"
+        "container-fps", "estimated-vf-fps" -> {
+            val vt = cachedVideoTrack
+            if (vt != null && vt.frameRateDen > 0) {
+                val fps = vt.frameRateNum.toFloat() / vt.frameRateDen
+                if (fps > 0) "%.2f".format(fps) else null
+            } else null
+        }
+        "file-format", "demuxer" -> {
+            val url = currentUrl?.lowercase() ?: ""
+            when {
+                url.contains(".m3u8") -> "hls"
+                url.contains(".ts") -> "mpegts"
+                url.startsWith("rtsp://") -> "rtsp"
+                else -> null
+            }
+        }
+        "protocol" -> {
+            val url = currentUrl?.lowercase() ?: ""
+            when {
+                url.startsWith("https://") -> "https"
+                url.startsWith("http://") -> "http"
+                url.startsWith("rtsp://") -> "rtsp"
+                url.startsWith("udp://") -> "udp"
+                url.startsWith("rtp://") -> "rtp"
+                else -> null
+            }
+        }
+        "video-params/channel-layout" -> {
+            val ch = cachedAudioTrack?.channels ?: 0
+            when (ch) {
+                1 -> "mono"
+                2 -> "stereo"
+                6 -> "5.1"
+                8 -> "7.1"
+                else -> if (ch > 0) "${ch}ch" else null
+            }
+        }
+        else -> null
+    }
+
+    override fun getPropertyInt(name: String): Int? = when (name) {
+        "width" -> cachedVideoTrack?.width?.takeIf { it > 0 } ?: _videoWidth.value.takeIf { it > 0 }
+        "height" -> cachedVideoTrack?.height?.takeIf { it > 0 } ?: _videoHeight.value.takeIf { it > 0 }
+        "dwidth" -> cachedVideoTrack?.width?.takeIf { it > 0 } ?: _videoWidth.value.takeIf { it > 0 }
+        "dheight" -> cachedVideoTrack?.height?.takeIf { it > 0 } ?: _videoHeight.value.takeIf { it > 0 }
+        "video-bitrate" -> {
+            // VLC track.bitrate 单位是 bps，与 mpv 一致
+            val media = mediaPlayer.media
+            var bitrate = 0
+            try {
+                for (i in 0 until (media?.trackCount ?: 0)) {
+                    val track = media?.getTrack(i) ?: continue
+                    if (track.type == IMedia.Track.Type.Video) {
+                        bitrate = track.bitrate
+                        break
+                    }
+                }
+            } catch (e: Exception) {}
+            bitrate.takeIf { it > 0 }
+        }
+        "audio-bitrate" -> {
+            val media = mediaPlayer.media
+            var bitrate = 0
+            try {
+                for (i in 0 until (media?.trackCount ?: 0)) {
+                    val track = media?.getTrack(i) ?: continue
+                    if (track.type == IMedia.Track.Type.Audio) {
+                        bitrate = track.bitrate
+                        break
+                    }
+                }
+            } catch (e: Exception) {}
+            bitrate.takeIf { it > 0 }
+        }
+        "audio-params/channel-count" -> cachedAudioTrack?.channels?.takeIf { it > 0 }
+        "audio-params/samplerate" -> cachedAudioTrack?.rate?.takeIf { it > 0 }
+        else -> null
+    }
+
+    override fun getPropertyDouble(name: String): Double? = when (name) {
+        "demuxer-cache-duration" -> {
+            // VLC 通过 mediaPlayer.time 和缓存估算（粗略）
+            try {
+                val cacheMs = mediaPlayer.time
+                if (cacheMs > 0) cacheMs / 1000.0 else null
+            } catch (e: Exception) { null }
+        }
+        else -> null
+    }
+
+    // -----------------------------------------------------------------
     // 硬件解码切换
     // -----------------------------------------------------------------
 
@@ -700,6 +844,8 @@ class VlcController(context: Context) : Player, MediaPlayer.EventListener {
                 }
                 updateTrackList()
                 updateVideoSize()
+                // 刷新缓存的轨道信息（供 getPropertyString/getPropertyInt 使用）
+                refreshCachedTracks()
             }
 
             MediaPlayer.Event.Paused -> {

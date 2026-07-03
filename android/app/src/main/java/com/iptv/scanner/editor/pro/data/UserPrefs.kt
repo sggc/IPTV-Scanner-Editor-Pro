@@ -178,6 +178,7 @@ class UserPrefs private constructor() {
             .remove(KEY_VO_FALLBACK)
             .remove(KEY_PLAYER_TYPE)
             .remove(KEY_HDR_MODE)
+            .remove(KEY_IJK_TESTING)
             .apply()
     }
 
@@ -194,6 +195,28 @@ class UserPrefs private constructor() {
     fun setPlayerType(type: String) {
         prefs.edit().putString(KEY_PLAYER_TYPE, type).apply()
     }
+
+    // -----------------------------------------------------------------
+    // IJK 启动崩溃保护
+    //
+    // IJK native 库在某些设备/片源上可能触发 SIGSEGV，Java try-catch 无法捕获。
+    // 流程：switchPlayer(IJK) 时 markIjkTesting() → IjkController.onPrepared 时
+    // clearIjkTesting()（说明 IJK 可用）→ 启动时若仍为 true，说明上次切换 IJK
+    // 后未成功 prepared 就崩溃，回退到 MPV，避免循环崩溃。
+    // -----------------------------------------------------------------
+
+    /** 标记开始尝试 IJK（切换到 IJK 时调用） */
+    fun markIjkTesting() {
+        prefs.edit().putBoolean(KEY_IJK_TESTING, true).apply()
+    }
+
+    /** 清除 IJK 测试标志（IJK onPrepared 或 detach 时调用） */
+    fun clearIjkTesting() {
+        prefs.edit().putBoolean(KEY_IJK_TESTING, false).apply()
+    }
+
+    /** 上次启动后 IJK 是否处于"测试中"状态未清除（说明崩溃） */
+    fun isIjkTesting(): Boolean = prefs.getBoolean(KEY_IJK_TESTING, false)
 
     // -----------------------------------------------------------------
     // 局域网管理设置
@@ -557,6 +580,10 @@ class UserPrefs private constructor() {
         private const val KEY_PLAYER_TYPE = "player_type"
         private const val KEY_HDR_MODE = "hdr_output_mode"
         private const val DEFAULT_HDR_MODE = "disable"
+        // IJK 启动崩溃保护：切换到 IJK 时置 true，onPrepared/detach 时清除；
+        // 启动时若仍为 true，说明上次 IJK 在切换后未成功 prepared 就崩溃（native SIGSEGV
+        // 无法被 Java try-catch 捕获），下次启动自动回退到 MPV，避免循环崩溃。
+        private const val KEY_IJK_TESTING = "ijk_testing"
 
         // 局域网管理设置 key
         private const val KEY_ADMIN_AUTO_STOP = "admin_auto_stop"

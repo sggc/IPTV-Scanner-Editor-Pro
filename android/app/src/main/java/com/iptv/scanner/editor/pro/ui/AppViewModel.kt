@@ -124,19 +124,49 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 当前活跃的 Player 实例。
      *
      * 启动时根据持久化的 [_playerType] 创建对应实例（MPV 用单例，其他新建实例），
-     * 保证 _player 与 _playerType 一致。IJK native 不可用时回退到 MPV（_playerType
-     * 在 init 块中修正为 MPV）。
+     * 保证 _player 与 _playerType 一致。IJK native 不可用或上次启动崩溃时回退到 MPV
+     * （_playerType 在 init 块中修正为 MPV）。
+     *
+     * 安全保护：
+     * 1. IJK 启动崩溃检查：上次启动后切换到 IJK 时若 native SIGSEGV（Java try-catch
+     *    无法捕获），isIjkTesting()=true，本次启动直接回退到 MPV，避免循环崩溃。
+     * 2. try-catch 保护：EXO/VLC/IJK 构造失败时回退到 MPV，避免 App 进入无可用播放器状态。
      */
-    private val _player = MutableStateFlow<Player>(
-        when (_playerType.value) {
-            PlayerType.MPV -> mpvSingleton
-            PlayerType.EXO -> ExoPlayerController(getApplication())
-            PlayerType.VLC -> VlcController(getApplication())
-            PlayerType.IJK -> IjkController(getApplication()).let {
-                if (it.nativeAvailable) it else mpvSingleton
-            }
+    private val _player = MutableStateFlow<Player>(createInitialPlayer())
+
+    /**
+     * 启动时创建初始 Player 实例（工厂方法，便于 try-catch 保护）。
+     *
+     * @return 创建的 Player 实例；失败时回退到 [mpvSingleton]
+     */
+    private fun createInitialPlayer(): Player {
+        val type = _playerType.value
+        // IJK 启动崩溃保护：上次启动后切换到 IJK 未成功 prepared 就崩溃，
+        // isIjkTesting 仍为 true，本次启动直接用 MPV，避免再次崩溃。
+        if (type == PlayerType.IJK && userPrefs.isIjkTesting()) {
+            Log.w(TAG, "createInitialPlayer: IJK 上次启动崩溃（isIjkTesting=true），回退到 MPV")
+            userPrefs.clearIjkTesting()
+            _playerType.value = PlayerType.MPV
+            userPrefs.setPlayerType(PlayerType.MPV.name)
+            return mpvSingleton
         }
-    )
+        return try {
+            when (type) {
+                PlayerType.MPV -> mpvSingleton
+                PlayerType.EXO -> ExoPlayerController(getApplication())
+                PlayerType.VLC -> VlcController(getApplication())
+                PlayerType.IJK -> IjkController(getApplication()).let {
+                    if (it.nativeAvailable) it else {
+                        Log.w(TAG, "createInitialPlayer: IJK native 不可用，回退到 MPV")
+                        mpvSingleton
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "createInitialPlayer: create $type failed, fallback to MPV", e)
+            mpvSingleton
+        }
+    }
 
     /** 当前播放器实例（Player 接口类型，UI 用 mpv.xxx 调用 Player 接口方法） */
     val mpv: Player get() = _player.value
@@ -159,28 +189,52 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val oldPlayer = _player.value
         // 1. 保存当前播放状态（url + timePos）
         val savedState = oldPlayer.savePlaybackState()
-        // 2. detach 旧实例（释放资源）
-        oldPlayer.detach()
-        // 3. 创建新实例（mpv 用单例，其他播放器新建实例）
-        // 显式声明类型为 Player，避免 when 表达式类型推断为 Any
-        val newPlayer: Player = when (newType) {
-            PlayerType.MPV -> mpvSingleton
-            PlayerType.EXO -> ExoPlayerController(getApplication())
-            PlayerType.VLC -> VlcController(getApplication())
-            PlayerType.IJK -> IjkController(getApplication())
+        // 2. 先创建新实例（try-catch 保护），成功后再 detach 旧实例。
+        //    顺序很重要：若先 detach 旧实例再创建新实例，新实例创建失败时旧实例已失效，
+        //    App 将进入无可用播放器的状态。
+        val newPlayer: Player = try {
+            when (newType) {
+                PlayerType.MPV -> mpvSingleton
+                PlayerType.EXO -> ExoPlayerController(getApplication())
+                PlayerType.VLC -> VlcController(getApplication())
+                PlayerType.IJK -> IjkController(getApplication())
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "switchPlayer: create $newType failed", e)
+            showOsd("播放器", "切换到 ${newType.displayName} 失败: ${e.message}，保持当前播放器")
+            return
         }
-        // 4. 检测 IJK native 库是否可用（x86/x86_64 设备上不可用）
+        // 3. 检测 IJK native 库是否可用（x86/x86_64 设备或 native 崩溃后不可用）
         if (newType == PlayerType.IJK && newPlayer is IjkController && !newPlayer.nativeAvailable) {
-            // IJK native 不可用，oldPlayer 已 detach 无法复用，回退到 MPV 单例作为安全兜底
+            // IJK native 不可用，不 detach 旧播放器，回退到 MPV 单例
+            if (oldPlayer === mpvSingleton) {
+                // 旧播放器已是 MPV，无需切换
+                showOsd("播放器", "IJK 在此设备不可用（需 ARM 架构），保持 MPV")
+                return
+            }
+            // 旧播放器不是 MPV，切换到 MPV 作为安全兜底
+            oldPlayer.detach()
             _player.value = mpvSingleton
             _playerType.value = PlayerType.MPV
             userPrefs.setPlayerType(PlayerType.MPV.name)
+            userPrefs.clearIjkTesting()  // IJK 不可用，清除标志避免下次启动误判
+            _hardwareDecode.value = mpvSingleton.isHardwareDecodeEnabled()
+            pendingRestoreState = savedState
+            observePlayerError(mpvSingleton)
             showOsd("播放器", "IJK 在此设备不可用（需 ARM 架构），已回退到 MPV")
             return
         }
+        // 4. 新实例创建成功，detach 旧实例（释放资源）
+        oldPlayer.detach()
         _player.value = newPlayer
         _playerType.value = newType
         userPrefs.setPlayerType(newType.name)
+        // IJK 启动崩溃保护：切换到 IJK 时标记测试中，onPrepared 或 detach 时清除。
+        // 若切换后 native SIGSEGV（无法被 try-catch 捕获），下次启动时 isIjkTesting()=true，
+        // 自动回退到 MPV，避免循环崩溃。
+        if (newType == PlayerType.IJK) {
+            userPrefs.markIjkTesting()
+        }
         // 同步硬件解码状态（新播放器的默认值）
         _hardwareDecode.value = newPlayer.isHardwareDecodeEnabled()
         // 5. 保存待恢复状态，等 View 重建后 attachView 完成再恢复
@@ -253,10 +307,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // 所有属性初始化完成后再启动初始化（Kotlin 按声明顺序初始化，init 块必须在所有 StateFlow 声明之后）
     init {
-        // 修正 IJK native 不可用时的 _playerType（_player 已在声明处回退到 mpvSingleton）
+        // 修正 IJK native 不可用时的 _playerType（_player 已在 createInitialPlayer 中回退到 mpvSingleton）
         if (_playerType.value == PlayerType.IJK && _player.value === mpvSingleton) {
             _playerType.value = PlayerType.MPV
             userPrefs.setPlayerType(PlayerType.MPV.name)
+            userPrefs.clearIjkTesting()  // 双重保险：IJK 不可用时清除标志
         }
         // 监听非 MPV 播放器的错误状态（启动时 _player 可能是 EXO/IJK/VLC）
         observePlayerError(_player.value)

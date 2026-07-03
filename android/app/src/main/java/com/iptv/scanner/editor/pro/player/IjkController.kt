@@ -6,6 +6,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.SurfaceHolder
+import com.iptv.scanner.editor.pro.data.UserPrefs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -127,20 +128,18 @@ class IjkController(private val context: Context) : Player {
     /**
      * 尝试创建 IjkMediaPlayer 实例。
      * 返回 (nativeAvailable, player)：成功时 (true, 实例)，失败时 (false, null)。
+     *
+     * 捕获 Throwable（包括 RuntimeException、LinkageError 等），与 createPlayer 一致。
+     * 注意：native SIGSEGV 无法被 Java try-catch 捕获，会直接导致进程闪退。
+     * 对于 SIGSEGV 场景，通过 [markCrashed] 持久化标志位在下次启动时规避。
      */
     private fun tryCreatePlayer(): Pair<Boolean, IjkMediaPlayer?> {
         return try {
             val p = IjkMediaPlayer()
             setListeners(p)
             true to p
-        } catch (e: UnsatisfiedLinkError) {
-            Log.e(TAG, "Failed to load IJK native library: ${e.message}")
-            false to null
-        } catch (e: ExceptionInInitializerError) {
-            Log.e(TAG, "IJK class initialization failed: ${e.message}")
-            false to null
-        } catch (e: NoClassDefFoundError) {
-            Log.e(TAG, "IJK class not found: ${e.message}")
+        } catch (e: Throwable) {
+            Log.e(TAG, "tryCreatePlayer failed: ${e.javaClass.simpleName}: ${e.message}")
             false to null
         }
     }
@@ -279,6 +278,8 @@ class IjkController(private val context: Context) : Player {
 
     private fun onPrepared(mp: IMediaPlayer) {
         Log.i(TAG, "onPrepared")
+        // onPrepared 触发说明 IJK native 正常工作，清除启动崩溃保护标志
+        UserPrefs.getInstance().clearIjkTesting()
         _fileLoaded.value = true
         _eofReached.value = false
         _paused.value = false
@@ -425,6 +426,9 @@ class IjkController(private val context: Context) : Player {
         } catch (e: Exception) {
             Log.w(TAG, "detach release failed: ${e.message}")
         }
+        // 正常 detach 也清除 IJK 测试标志：说明用户主动切走（不是崩溃），
+        // 下次启动不会因 isIjkTesting=true 误判为崩溃。
+        UserPrefs.getInstance().clearIjkTesting()
         // 置 null，避免后续 attachSurface 调用已释放的 native 实例导致闪退。
         // 场景：switchPlayer 中 detach() 先于 key(playerType) 触发的 View 销毁执行，
         // 旧 IjkVideoView 销毁时 surfaceDestroyed → attachSurface(null) → ijkPlayer?.setDisplay(null)
@@ -745,6 +749,54 @@ class IjkController(private val context: Context) : Player {
             Log.w(TAG, "getMediaInfo failed: ${e.message}")
             emptyMap()
         }
+    }
+
+    // -----------------------------------------------------------------
+    // mpv 兼容属性读取（让 StreamQualityPanel 能显示 IJK 的媒体信息）
+    //
+    // IJK 的 API 较有限，主要提供分辨率、时长、解码器名称。
+    // 编解码器、帧率、码率等需要从 IjkMediaPlayer.getMediaInfo 解析。
+    // -----------------------------------------------------------------
+
+    override fun getPropertyString(name: String): String? = when (name) {
+        "vo" -> "ijk"
+        "hwdec-current" -> if (hardwareDecode) "mediacodec" else "ffmpeg"
+        "video-codec", "video-format" -> {
+            // 从 mediaInfo.mVideoDecoder 获取（如 "mediacodec" 或 "ffmpeg"）
+            try { ijkPlayer?.mediaInfo?.mVideoDecoder } catch (e: Exception) { null }
+        }
+        "audio-codec", "audio-codec-name" -> {
+            try { ijkPlayer?.mediaInfo?.mAudioDecoder } catch (e: Exception) { null }
+        }
+        "file-format", "demuxer" -> {
+            val url = currentUrl.lowercase()
+            when {
+                url.contains(".m3u8") -> "hls"
+                url.contains(".ts") -> "mpegts"
+                url.startsWith("rtsp://") -> "rtsp"
+                else -> null
+            }
+        }
+        "protocol" -> {
+            val url = currentUrl.lowercase()
+            when {
+                url.startsWith("https://") -> "https"
+                url.startsWith("http://") -> "http"
+                url.startsWith("rtsp://") -> "rtsp"
+                url.startsWith("udp://") -> "udp"
+                url.startsWith("rtp://") -> "rtp"
+                else -> null
+            }
+        }
+        else -> null
+    }
+
+    override fun getPropertyInt(name: String): Int? = when (name) {
+        "width" -> _videoWidth.value.takeIf { it > 0 }
+        "height" -> _videoHeight.value.takeIf { it > 0 }
+        "dwidth" -> _videoWidth.value.takeIf { it > 0 }
+        "dheight" -> _videoHeight.value.takeIf { it > 0 }
+        else -> null
     }
 
     // -----------------------------------------------------------------

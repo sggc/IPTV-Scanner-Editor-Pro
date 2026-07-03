@@ -1,7 +1,6 @@
 package com.iptv.scanner.editor.pro.player
 
 import android.content.Context
-import android.graphics.PixelFormat
 import android.util.AttributeSet
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -13,7 +12,8 @@ import android.view.SurfaceView
  * - 使用 SurfaceView（ANativeWindow 支撑，IjkMediaPlayer.setDisplay 直接渲染）
  * - 不用 TextureView（IJK 的 SurfaceHolder 绑定方式不兼容 SurfaceTexture）
  * - SurfaceView 默认 Z-order 在普通 View 之后，Compose 控制层可叠加显示
- * - 像素格式设为 RGBA_8888（与 MPVView 一致，确保兼容性）
+ * - 不显式设置像素格式：让系统根据 MediaCodec 输出自动协商（支持 HDR 直通）。
+ *   之前设置 RGBA_8888 会强制 8 位 SDR 格式，阻止 HDR 内容直通。
  *
  * 生命周期：
  * 1. Compose AndroidView 创建 IjkVideoView
@@ -38,8 +38,8 @@ class IjkVideoView @JvmOverloads constructor(
      */
     fun attachController(controller: IjkController) {
         this.controller = controller
-        // 像素格式与 MPVView 对齐（RGBA_8888）
-        holder.setFormat(PixelFormat.RGBA_8888)
+        // 不设置像素格式：让系统根据 MediaCodec 输出自动协商，支持 HDR 直通。
+        // （之前设置 RGBA_8888 会强制 8 位 SDR，阻止 HDR 内容直通）
         holder.addCallback(this)
     }
 

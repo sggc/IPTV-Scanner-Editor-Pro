@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.media3.common.C
+import androidx.media3.common.ColorInfo
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
@@ -164,23 +165,38 @@ class ExoPlayerController(private val context: Context) : Player {
                     _eofReached.value = false
                     val dur = exoPlayer.duration
                     if (dur > 0) _duration.value = dur / 1000.0
+                    // STATE_READY 时根据 playWhenReady 同步 paused 状态
+                    // （onIsPlayingChanged 可能延迟触发，这里确保 UI 立即正确）
+                    _paused.value = !exoPlayer.playWhenReady
                 }
                 Media3Player.STATE_ENDED -> {
                     _eofReached.value = true
                     _fileLoaded.value = false
+                    _paused.value = true
                 }
                 Media3Player.STATE_IDLE -> {
                     _fileLoaded.value = false
                     _eofReached.value = false
+                    _paused.value = true
                 }
                 Media3Player.STATE_BUFFERING -> {
                     // 缓冲中：保持 fileLoaded 不变（避免 UI 闪烁）
+                    // 不更新 _paused：用户已通过 playFile 请求播放，缓冲期间应显示"播放中"
+                    // 而非"已暂停"（之前 onIsPlayingChanged(false) 会错误地设置 _paused=true）
                 }
             }
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            _paused.value = !isPlaying
+            // 只在 STATE_READY 时根据 isPlaying 更新 paused 状态。
+            // 缓冲期间（STATE_BUFFERING）isPlaying=false 是正常的，不应显示"已暂停"。
+            val state = exoPlayer.playbackState
+            if (state == Media3Player.STATE_READY) {
+                _paused.value = !isPlaying
+            } else if (state == Media3Player.STATE_ENDED || state == Media3Player.STATE_IDLE) {
+                _paused.value = true
+            }
+            // STATE_BUFFERING：保持 playFile 设置的 _paused=false
         }
 
         override fun onPositionDiscontinuity(
@@ -311,6 +327,11 @@ class ExoPlayerController(private val context: Context) : Player {
         exoPlayer.setMediaItem(mediaItem)
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
+        // 乐观设置 _paused=false：用户已通过 playFile 明确请求播放，
+        // 缓冲期间（STATE_BUFFERING）应显示"播放中"，避免 onIsPlayingChanged(false)
+        // 错误地将 _paused 设为 true 导致 UI 显示"已暂停"。
+        // 实际播放失败时由 onPlayerError 设置 _paused=true。
+        _paused.value = false
     }
 
     override fun stop() {
@@ -484,6 +505,160 @@ class ExoPlayerController(private val context: Context) : Player {
         }
         if (_duration.value > 0) info["duration"] = _duration.value.toString()
         return info
+    }
+
+    // -----------------------------------------------------------------
+    // mpv 兼容属性读取（让 StreamQualityPanel 能显示 EXO 的媒体信息）
+    //
+    // ExoPlayer 的 videoFormat / audioFormat 提供编解码器、分辨率、帧率、码率、
+    // 颜色信息（HDR/SDR、色域、传输函数）等，映射到 mpv 属性名供 UI 复用。
+    // -----------------------------------------------------------------
+
+    override fun getPropertyString(name: String): String? = when (name) {
+        "video-codec", "video-format" ->
+            exoPlayer.videoFormat?.sampleMimeType
+        "audio-codec", "audio-codec-name" ->
+            exoPlayer.audioFormat?.sampleMimeType
+        "vo" -> "exo"
+        "hwdec-current" -> if (hardwareDecode) "mediacodec" else "ffmpeg"
+        "container-fps", "estimated-vf-fps" ->
+            exoPlayer.videoFormat?.frameRate?.takeIf { it > 0f }?.toString()
+        "file-format", "demuxer" -> {
+            // 从 URL 推断容器格式
+            val url = currentUrl?.lowercase() ?: ""
+            when {
+                url.contains(".m3u8") -> "hls"
+                url.contains(".mpd") -> "dash"
+                url.contains(".ts") -> "mpegts"
+                url.startsWith("rtsp://") -> "rtsp"
+                else -> null
+            }
+        }
+        "protocol" -> {
+            val url = currentUrl?.lowercase() ?: ""
+            when {
+                url.startsWith("https://") -> "https"
+                url.startsWith("http://") -> "http"
+                url.startsWith("rtsp://") -> "rtsp"
+                url.startsWith("udp://") -> "udp"
+                url.startsWith("rtp://") -> "rtp"
+                else -> null
+            }
+        }
+        "video-params/pixelformat" -> {
+            // ExoPlayer 1.4.1 的 ColorInfo 无 bitDepth 字段，从 colorTransfer 推断位深
+            // HDR（PQ/HLG）通常是 10 位，SDR 通常是 8 位
+            val ci = exoPlayer.videoFormat?.colorInfo
+            if (ci != null && isHdrColorInfo(ci)) "yuv420p10le" else "yuv420p"
+        }
+        "video-params/colormatrix" -> colorInfoColormatrix(exoPlayer.videoFormat?.colorInfo)
+        "video-params/primaries" -> colorInfoPrimaries(exoPlayer.videoFormat?.colorInfo)
+        "video-params/gamma" -> colorInfoGamma(exoPlayer.videoFormat?.colorInfo)
+        "video-params/aspect" -> {
+            val w = exoPlayer.videoFormat?.width ?: _videoWidth.value
+            val h = exoPlayer.videoFormat?.height ?: _videoHeight.value
+            if (w > 0 && h > 0) "%.4f".format(w.toFloat() / h.toFloat()) else null
+        }
+        "video-params/bits-per-component" -> {
+            // 从 colorTransfer 推断位深（HDR=10bit，SDR=8bit）
+            val ci = exoPlayer.videoFormat?.colorInfo
+            if (ci != null) {
+                if (isHdrColorInfo(ci)) "10" else "8"
+            } else null
+        }
+        "audio-params/channel-layout" -> {
+            val ch = exoPlayer.audioFormat?.channelCount ?: 0
+            when (ch) {
+                1 -> "mono"
+                2 -> "stereo"
+                6 -> "5.1"
+                8 -> "7.1"
+                else -> if (ch > 0) "${ch}ch" else null
+            }
+        }
+        else -> null
+    }
+
+    override fun getPropertyInt(name: String): Int? = when (name) {
+        "width" -> exoPlayer.videoFormat?.width ?: _videoWidth.value.takeIf { it > 0 }
+        "height" -> exoPlayer.videoFormat?.height ?: _videoHeight.value.takeIf { it > 0 }
+        "dwidth" -> exoPlayer.videoSize.width.takeIf { it > 0 }
+            ?: exoPlayer.videoFormat?.width
+        "dheight" -> exoPlayer.videoSize.height.takeIf { it > 0 }
+            ?: exoPlayer.videoFormat?.height
+        "video-bitrate" -> exoPlayer.videoFormat?.bitrate?.takeIf { it > 0 }
+        "audio-bitrate" -> exoPlayer.audioFormat?.bitrate?.takeIf { it > 0 }
+        "audio-params/channel-count" -> exoPlayer.audioFormat?.channelCount?.takeIf { it > 0 }
+        "audio-params/samplerate" -> exoPlayer.audioFormat?.sampleRate?.takeIf { it > 0 }
+        "audio-params/bits-per-sample" -> {
+            // Format 没有 bitsPerSample 字段，从 pcmEncoding 推断（仅 PCM 有意义）
+            when (exoPlayer.audioFormat?.pcmEncoding) {
+                C.ENCODING_PCM_8BIT -> 8
+                C.ENCODING_PCM_16BIT -> 16
+                C.ENCODING_PCM_24BIT -> 24
+                C.ENCODING_PCM_32BIT -> 32
+                C.ENCODING_PCM_FLOAT -> 32
+                else -> null
+            }
+        }
+        "demuxer-bitrate" -> {
+            // ExoPlayer 无直接 demuxer 码率，用 video+audio bitrate 估算
+            val v = exoPlayer.videoFormat?.bitrate ?: 0
+            val a = exoPlayer.audioFormat?.bitrate ?: 0
+            (v + a).takeIf { it > 0 }
+        }
+        else -> null
+    }
+
+    override fun getPropertyDouble(name: String): Double? = when (name) {
+        "video-params/sig-peak" -> {
+            // ExoPlayer 不暴露 sig-peak，从 HDR 类型推断（HDR 内容通常 sig-peak > 1）
+            val ci = exoPlayer.videoFormat?.colorInfo
+            if (ci != null && isHdrColorInfo(ci)) 1.0 else null
+        }
+        "demuxer-cache-duration" -> {
+            // ExoPlayer 无直接的缓存时长接口，估算（缓冲中时返回 0）
+            if (exoPlayer.playbackState == Media3Player.STATE_BUFFERING) 0.0 else null
+        }
+        else -> null
+    }
+
+    /** 判断 ColorInfo 是否为 HDR（PQ 或 HLG 传输函数） */
+    private fun isHdrColorInfo(ci: ColorInfo): Boolean {
+        // HDR 内容使用 PQ (ST2084) 或 HLG 传输函数，SDR 不是 HDR
+        return ci.colorTransfer == C.COLOR_TRANSFER_HLG ||
+            ci.colorTransfer == C.COLOR_TRANSFER_ST2084
+    }
+
+    /** ColorInfo → mpv colormatrix 名称 */
+    private fun colorInfoColormatrix(ci: ColorInfo?): String? {
+        if (ci == null) return null
+        return when (ci.colorSpace) {
+            C.COLOR_SPACE_BT709 -> "bt.709"
+            C.COLOR_SPACE_BT2020 -> "bt.2020nc"
+            else -> null
+        }
+    }
+
+    /** ColorInfo → mpv primaries 名称 */
+    private fun colorInfoPrimaries(ci: ColorInfo?): String? {
+        if (ci == null) return null
+        return when (ci.colorSpace) {
+            C.COLOR_SPACE_BT709 -> "bt.709"
+            C.COLOR_SPACE_BT2020 -> "bt.2020"
+            else -> null
+        }
+    }
+
+    /** ColorInfo → mpv gamma（transfer function）名称 */
+    private fun colorInfoGamma(ci: ColorInfo?): String? {
+        if (ci == null) return null
+        return when (ci.colorTransfer) {
+            C.COLOR_TRANSFER_SDR -> "bt.1886"
+            C.COLOR_TRANSFER_HLG -> "hlg"
+            C.COLOR_TRANSFER_ST2084 -> "pq"
+            else -> null
+        }
     }
 
     // -----------------------------------------------------------------
