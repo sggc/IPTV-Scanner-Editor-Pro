@@ -58,19 +58,26 @@ jobs:
         # 1. FFmpeg：使用 sumingyd/FFmpeg fork（fork 自 llawsxx/FFmpeg）
         #    包含 CAVS Guangdian profile (AVS1-P16) 解码支持
         #    修改方式：用 libcavs.c + libcavsdec.c 替换原 cavsdec.c（内部实现，无需外部库）
-        # 2. shaderc 依赖：固定 spirv-headers、spirv-tools、glslang 到兼容版本
+        # 2. 禁用 libdavs2 和 NVENC：sumingyd/FFmpeg fork 与 mpv-winbuild-cmake 的依赖版本不兼容
+        #    - libdavs2: AVS2 解码器结构体成员缺失
+        #    - NVENC: nvcodec-headers 中 NV_ENC_CLOCK_TIMESTAMP_SET.countingType 不存在
+        #    CAVS (AVS1) 不依赖这两者，禁用不影响 CAVS Guangdian profile 支持
+        # 3. shaderc 依赖：固定 spirv-headers、spirv-tools、glslang 到兼容版本
         run: |
           cd mpv-winbuild-cmake
           # 1. 替换 FFmpeg 仓库为 sumingyd/FFmpeg fork
           sed -i 's|https://github.com/FFmpeg/FFmpeg.git|https://github.com/sumingyd/FFmpeg.git|' packages/ffmpeg.cmake
-          # 2. 禁用 libdavs2 (AVS2 解码器)：sumingyd/FFmpeg fork 的 libdavs2.c 与
-          #    mpv-winbuild-cmake 构建的 davs2 库版本不兼容 (结构体成员缺失)
-          #    CAVS (AVS1) 不依赖 libdavs2，禁用它不影响 CAVS Guangdian profile 支持
+          # 2. 禁用 libdavs2 (AVS2 解码器) 和 NVENC (NVIDIA 硬件编码器)
+          #    sumingyd/FFmpeg fork 与 mpv-winbuild-cmake 构建的依赖版本不兼容：
+          #    - libdavs2: 结构体成员缺失
+          #    - NVENC: nvcodec-headers 版本中 NV_ENC_CLOCK_TIMESTAMP_SET.countingType 不存在
+          #    CAVS (AVS1) 不依赖这两者，禁用不影响 CAVS Guangdian profile 支持
           sed -i 's|set(ffmpeg_davs2_cmd "--enable-libdavs2")|set(ffmpeg_davs2_cmd "")|' cmake/packages_check.cmake
+          sed -i 's|set(ffmpeg_cuda "--enable-cuda-llvm --enable-cuvid --enable-nvdec --enable-nvenc")|set(ffmpeg_cuda "")|' cmake/packages_check.cmake
           echo "=== Patched ffmpeg.cmake (GIT_REPOSITORY) ==="
           grep "GIT_REPOSITORY" packages/ffmpeg.cmake
-          echo "=== Patched packages_check.cmake (ffmpeg_davs2_cmd) ==="
-          grep "ffmpeg_davs2_cmd" cmake/packages_check.cmake
+          echo "=== Patched packages_check.cmake (ffmpeg_davs2_cmd, ffmpeg_cuda) ==="
+          grep -E "ffmpeg_davs2_cmd|ffmpeg_cuda" cmake/packages_check.cmake
           # 3. 固定 spirv-headers、spirv-tools、glslang 到 shaderc DEPS 文件声明的兼容版本
           #    原因：这三个包各自跟踪 main 分支，但 main 分支版本可能不兼容
           #    导致 spirv-tools 编译时 SPV_OPERAND_TYPE_GATHER_MODES 未定义错误
