@@ -233,7 +233,9 @@ class IjkController(private val context: Context) : Player {
         // 必须实现这两个方法，否则编译报错 "does not implement abstract member"
         p.setOnInfoListener(object : IMediaPlayer.OnInfoListener {
             override fun onInfo(mp: IMediaPlayer?, what: Int, extra: Int): Boolean {
-                onInfo(mp, what, extra)
+                // 必须用 this@IjkController 限定，否则递归调用本匿名对象的 onInfo（自身）
+                // 导致 StackOverflowError
+                this@IjkController.onInfo(mp, what, extra)
                 return true
             }
             override fun onInfoSEI(mp: IMediaPlayer?, what: Int, extra: Int, sei: String?): Boolean {
