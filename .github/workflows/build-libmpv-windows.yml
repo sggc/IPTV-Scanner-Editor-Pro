@@ -53,10 +53,12 @@ jobs:
           git clone --depth 1 https://github.com/shinchiro/mpv-winbuild-cmake.git
           git config --global --add safe.directory $PWD/mpv-winbuild-cmake
 
-      - name: Patch FFmpeg source to use sumingyd/FFmpeg fork
-        # 使用 sumingyd/FFmpeg fork（fork 自 llawsxx/FFmpeg）
-        # 包含 CAVS Guangdian profile (AVS1-P16) 解码支持
-        # 修改方式：用 libcavs.c + libcavsdec.c 替换原 cavsdec.c（内部实现，无需外部库）
+      - name: Patch sources for CAVS and shaderc support
+        # 修补 mpv-winbuild-cmake 的源码配置：
+        # 1. FFmpeg：使用 sumingyd/FFmpeg fork（fork 自 llawsxx/FFmpeg）
+        #    包含 CAVS Guangdian profile (AVS1-P16) 解码支持
+        #    修改方式：用 libcavs.c + libcavsdec.c 替换原 cavsdec.c（内部实现，无需外部库）
+        # 2. shaderc 依赖：固定 spirv-headers、spirv-tools、glslang 到兼容版本
         run: |
           cd mpv-winbuild-cmake
           # 1. 替换 FFmpeg 仓库为 sumingyd/FFmpeg fork
@@ -69,6 +71,24 @@ jobs:
           grep "GIT_REPOSITORY" packages/ffmpeg.cmake
           echo "=== Patched packages_check.cmake (ffmpeg_davs2_cmd) ==="
           grep "ffmpeg_davs2_cmd" cmake/packages_check.cmake
+          # 3. 固定 spirv-headers、spirv-tools、glslang 到 shaderc DEPS 文件声明的兼容版本
+          #    原因：这三个包各自跟踪 main 分支，但 main 分支版本可能不兼容
+          #    导致 spirv-tools 编译时 SPV_OPERAND_TYPE_GATHER_MODES 未定义错误
+          #    shaderc 项目的 DEPS 文件声明了配套的 commit hash
+          #    同时设置 _EP_GIT_RESET 属性，让 force_rebuild_git 用 commit hash 作为 reset 目标
+          #    否则 force_rebuild_git 会用 @{u} 重置，detached HEAD 时 git rev-parse @{u} 失败
+          sed -i 's|GIT_TAG main|GIT_TAG daa093dd29aab8cbb6562b808370562f56e399fb|' packages/spirv-headers.cmake
+          sed -i '/force_rebuild_git(spirv-headers)/i set_property(TARGET spirv-headers PROPERTY _EP_GIT_RESET "daa093dd29aab8cbb6562b808370562f56e399fb")' packages/spirv-headers.cmake
+          sed -i 's|GIT_TAG main|GIT_TAG d5bbf95d87dd6d2694fbf09acfb42a00c93575e8|' packages/spirv-tools.cmake
+          sed -i '/force_rebuild_git(spirv-tools)/i set_property(TARGET spirv-tools PROPERTY _EP_GIT_RESET "d5bbf95d87dd6d2694fbf09acfb42a00c93575e8")' packages/spirv-tools.cmake
+          sed -i 's|GIT_TAG main|GIT_TAG ce138e2c2d6992b31ff4cd2e955904637785a881|' packages/glslang.cmake
+          sed -i '/force_rebuild_git(glslang)/i set_property(TARGET glslang PROPERTY _EP_GIT_RESET "ce138e2c2d6992b31ff4cd2e955904637785a881")' packages/glslang.cmake
+          echo "=== Patched spirv-headers.cmake ==="
+          grep -E "GIT_TAG|_EP_GIT_RESET" packages/spirv-headers.cmake
+          echo "=== Patched spirv-tools.cmake ==="
+          grep -E "GIT_TAG|_EP_GIT_RESET" packages/spirv-tools.cmake
+          echo "=== Patched glslang.cmake ==="
+          grep -E "GIT_TAG|_EP_GIT_RESET" packages/glslang.cmake
 
       - name: Loading toolchain cache
         # 缓存 GCC 交叉编译工具链构建结果，失败也保存（重试可复用源码和配置）
@@ -165,6 +185,13 @@ jobs:
           # 如果不删除 stamp 文件，ninja 会跳过 configure，使用旧的配置结果
           rm -f build_x86_64/packages/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-configure
           rm -f build_x86_64/packages/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-build
+          # 删除 spirv-headers、spirv-tools、glslang 的 HEAD stamp 文件
+          # 原因：force_rebuild_git 的 reset_head.sh 会检查 HEAD 文件是否存在
+          # 如果 HEAD 文件存在且与 git rev-parse @{u} 匹配，会走 else 分支（git reset --hard -q）
+          # 不会更新到 commit hash。删除 HEAD 文件后，走 if 分支执行 git reset --hard ${reset}
+          rm -f build_x86_64/packages/spirv-headers-prefix/src/spirv-headers-stamp/HEAD
+          rm -f build_x86_64/packages/spirv-tools-prefix/src/spirv-tools-stamp/HEAD
+          rm -f build_x86_64/packages/glslang-prefix/src/glslang-stamp/HEAD
           ninja -C build_x86_64 update
           ninja -C build_x86_64 mpv || {
             echo "=== mpv build failed! Diagnostics below ==="
