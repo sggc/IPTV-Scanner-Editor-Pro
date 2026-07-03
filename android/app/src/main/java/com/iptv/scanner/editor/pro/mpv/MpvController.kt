@@ -193,9 +193,13 @@ class MpvController : MPVLib.EventObserver, Player {
                     MPVLib.setPropertyBoolean("pause", false)
                 }
                 // 重置 voFallbackTriggered：
-                // - 切换到 gpu：重新启用黑屏检测（用户主动想测试 gpu）
+                // - 切换到 gpu：重新启用黑屏检测，清除持久化的 fallback 标记
+                //   （用户主动切回 gpu，说明设备 GPU 正常，不应再被持久化锁定）
                 // - 切换到 mediacodec_embed：标记已 fallback（不需要再检测）
                 voFallbackTriggered = (vo != "gpu")
+                if (vo == "gpu") {
+                    UserPrefs.getInstance().setVoFallbackConfirmed(false)
+                }
                 Log.i(TAG, "setVoAndHwdec: vo=$vo, hwdec=$hwdec, voFallbackTriggered=$voFallbackTriggered")
             } catch (e: Throwable) {
                 Log.e(TAG, "setVoAndHwdec failed", e)
@@ -274,7 +278,10 @@ class MpvController : MPVLib.EventObserver, Player {
     // -----------------------------------------------------------------
     // 基础播放控制
     // -----------------------------------------------------------------
-    override fun playFile(url: String) = postOnUiThread { mpvView?.playFile(url) }
+    override fun playFile(url: String) = postOnUiThread {
+        setupProtocolOptions(url)
+        mpvView?.playFile(url)
+    }
     override fun stop() = postOnUiThread { mpvView?.stop() }
     override fun togglePause() = postOnUiThread { MPVLib.command(arrayOf("cycle", "pause")) }
     override fun setPause(p: Boolean) = postOnUiThread { MPVLib.setPropertyBoolean("pause", p) }
@@ -287,6 +294,65 @@ class MpvController : MPVLib.EventObserver, Player {
 
     override fun seekAbsolute(seconds: Double) =
         postOnUiThread { MPVLib.command(arrayOf("seek", seconds.toString(), "absolute")) }
+
+    /**
+     * 根据 URL 协议设置 mpv 解复用器/缓存选项。
+     * 与 PC 端 services/mpv_player_service.py _setup_protocol_options 对齐。
+     *
+     * MPVView.initialize() 已设置通用缓冲（demuxer-max-bytes=16MiB,
+     * demuxer-readahead-secs=1, force-seekable=yes），本方法针对特定协议覆盖：
+     * - HLS (m3u8)：增大预读到 120s，确保 segment 平滑切换（PC 端同样设置）
+     * - RTSP：使用 TCP 传输（避免 UDP 丢包），设置 5s 预读
+     * - MPEG-TS：显式指定 demuxer=mpegts，增大预读到 300s
+     * - 通用网络流：重置为默认值（避免上次 HLS/TS 的设置残留）
+     *
+     * 本地文件不设置协议选项（直接 return）。
+     */
+    private fun setupProtocolOptions(url: String) {
+        if (url.isEmpty()) return
+        val u = url.lowercase()
+        val isNetwork = u.startsWith("http://") || u.startsWith("https://") ||
+                u.startsWith("rtsp://") || u.startsWith("rtp://") || u.startsWith("udp://") ||
+                ".m3u8" in u
+        if (!isNetwork) return  // 本地文件不设置协议选项
+        try {
+            when {
+                // HLS (m3u8)：增大预读，确保 segment 平滑切换
+                ".m3u8" in u || "format=hls" in u -> {
+                    MPVLib.setPropertyString("demuxer-lavf-format", "")
+                    MPVLib.setPropertyString("cache", "yes")
+                    MPVLib.setPropertyString("force-seekable", "yes")
+                    MPVLib.setPropertyString("demuxer-readahead-secs", "120")
+                    Log.i(TAG, "HLS options: readahead=120s")
+                }
+                // RTSP：使用 TCP 传输（避免 UDP 丢包）
+                u.startsWith("rtsp://") -> {
+                    MPVLib.setPropertyString("rtsp-transport", "tcp")
+                    MPVLib.setPropertyString("cache", "yes")
+                    MPVLib.setPropertyString("demuxer-lavf-format", "")
+                    MPVLib.setPropertyString("demuxer-readahead-secs", "5")
+                    Log.i(TAG, "RTSP options: transport=tcp")
+                }
+                // MPEG-TS：显式指定 demuxer，增大预读
+                u.endsWith(".ts") || u.startsWith("udp://") || "/rtp/" in u -> {
+                    MPVLib.setPropertyString("demuxer", "lavf")
+                    MPVLib.setPropertyString("demuxer-lavf-format", "mpegts")
+                    MPVLib.setPropertyString("cache", "yes")
+                    MPVLib.setPropertyString("force-seekable", "yes")
+                    MPVLib.setPropertyString("demuxer-readahead-secs", "300")
+                    Log.i(TAG, "TS options: demuxer=mpegts readahead=300s")
+                }
+                else -> {
+                    // 通用网络流：重置为默认值（避免上次 HLS/TS 的设置残留）
+                    MPVLib.setPropertyString("demuxer-readahead-secs", "1")
+                    MPVLib.setPropertyString("force-seekable", "yes")
+                    Log.i(TAG, "Generic stream options: readahead=1s")
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "setupProtocolOptions failed: ${e.message}")
+        }
+    }
 
     // -----------------------------------------------------------------
     // 音量 / 静音 / 速度
@@ -775,9 +841,23 @@ class MpvController : MPVLib.EventObserver, Player {
             MPVLib.MpvEvent.MPV_EVENT_FILE_LOADED -> {
                 _fileLoaded.value = true
                 _eofReached.value = false
-                // 黑屏检测：文件加载后 6 秒检查 videoWidth 和 estimated-vfps，若渲染没工作则 fallback。
-                // 根因：mpv 0.41.0 + Mali-G76 等部分 GPU 存在 EGL 渲染兼容性问题，
-                // vo=gpu 会导致黑屏（有声音无画面）。用 mediacodec_embed 绕过 EGL 直接渲染到 Surface。
+                // Surface 重建后重新 loadfile，恢复播放位置（本地文件/VOD）
+                // 直播流 pendingResumePos=-1.0 不 seek，从最新位置播放
+                mpvView?.let { v ->
+                    val pos = v.pendingResumePos
+                    if (pos > 0) {
+                        v.pendingResumePos = -1.0
+                        postOnUiThread {
+                            try {
+                                MPVLib.command(arrayOf("seek", pos.toString(), "absolute"))
+                            } catch (e: Throwable) {
+                                Log.w(TAG, "resume seek after surface rebuild failed: ${e.message}")
+                            }
+                        }
+                    }
+                }
+                // 黑屏检测：文件加载后 6 秒检查 videoWidth，若解码器没工作则 fallback。
+                // 仅以 videoWidth==0 为准（不使用 estimated-vfps，避免 IPTV 流误判）。
                 scheduleBlackScreenCheck()
             }
             MPVLib.MpvEvent.MPV_EVENT_START_FILE -> {
@@ -794,28 +874,32 @@ class MpvController : MPVLib.EventObserver, Player {
         }
     }
 
-    /** 黑屏检测重试计数（避免直播流缓冲期间 estimated-vfps 暂时为 0 导致误判） */
+    /** 黑屏检测重试计数（避免直播流缓冲期间 videoWidth 暂时为 0 导致误判） */
     private var blackScreenRetryCount = 0
 
     /**
-     * 黑屏检测 Runnable：检查 videoWidth 和 estimated-vfps，若渲染没工作则触发 vo fallback。
+     * 黑屏检测 Runnable：检查 videoWidth，若解码器没工作则触发 vo fallback。
+     *
+     * 判断依据（仅 videoWidth==0）：
+     * - videoWidth==0 表示解码器没有输出视频帧，是确定的黑屏
+     * - 不再使用 estimated-vfps：IPTV 直播流（通过 rt2phttpd HTTP 代理）的
+     *   estimated-vfps 可能长时间为 0，即使视频正常渲染，会导致误判
      *
      * 防误判机制：
-     * - 直播流（HLS/RTMP）刚加载时 estimated-vfps 可能暂时为 0（缓冲未完成）
-     * - 首次检测到"黑屏"后 3 秒复查，连续两次确认才 fallback
-     * - 实际首次检测在文件加载后 6 秒（scheduleBlackScreenCheck），复查在 9 秒
+     * - 首次检测到 videoWidth==0 后 3 秒复查，连续两次确认才 fallback
+     * - 首次检测在文件加载后 6 秒（scheduleBlackScreenCheck），复查在 9 秒
      *
-     * 为什么用 estimated-vfps 而非仅 videoWidth？
-     * - vo=gpu 在部分 GPU（如 Mali-G76）存在 EGL 兼容性问题，导致渲染内容不到 Surface（黑屏有声音）
-     * - 此时解码器正常工作，width/height 都有值，但渲染器没实际输出帧
-     * - estimated-vfps（mpv 基于实际渲染帧计算的显示帧率）在渲染没工作时为 0
-     * - 综合 width==0 || estimated-vfps<=0 判断黑屏更可靠
+     * 不持久化 fallback 结果：
+     * - fallback 仅在本次会话生效，不写 setVoFallbackConfirmed(true)
+     * - 避免误判永久化（曾出现 IPTV 流 estimated-vfps 误判导致用户设备
+     *   被永久锁定为 mediacodec_embed，即使 GPU 正常）
+     * - 用户若需永久切换 vo，可在播放器设置中手动切换
      */
     private val blackScreenCheckRunnable: Runnable = Runnable {
         if (voFallbackTriggered) return@Runnable
         if (!_fileLoaded.value) return@Runnable
 
-        // 当前 vo：如果已经是 mediacodec_embed（用户手动切换或持久化的 fallback），不需要 fallback
+        // 当前 vo：如果已经是 mediacodec_embed（用户手动切换），不需要 fallback
         val currentVo = try {
             MPVLib.getPropertyString("vo") ?: ""
         } catch (e: Throwable) {
@@ -824,38 +908,20 @@ class MpvController : MPVLib.EventObserver, Player {
         }
         if (currentVo == "mediacodec_embed" || currentVo.isEmpty()) return@Runnable
 
-        // 黑屏判断：综合 videoWidth 和 estimated-vfps
-        // - videoWidth==0：解码器没工作（极端情况）
-        // - estimated-vfps<=0：渲染器没工作（EGL 兼容性问题，如 Mali-G76 vo=gpu 黑屏）
-        //   注意：width 即使黑屏也有值（解码器已解码，只是 EGL 渲染不到 Surface）
+        // 黑屏判断：仅以 videoWidth==0（解码器没工作）为准
         val videoWidth = _videoWidth.value
-        val estimatedVfps = try {
-            MPVLib.getPropertyString("estimated-vfps")?.toDoubleOrNull() ?: 0.0
-        } catch (e: Throwable) {
-            Log.w(TAG, "getPropertyString(estimated-vfps) failed", e)
-            0.0
-        }
-        Log.d(
-            TAG,
-            "blackScreenCheck: vo=$currentVo, videoWidth=$videoWidth, estimatedVfps=$estimatedVfps, attempt=${blackScreenRetryCount + 1}"
-        )
+        Log.d(TAG, "blackScreenCheck: vo=$currentVo, videoWidth=$videoWidth, attempt=${blackScreenRetryCount + 1}")
 
-        if (videoWidth == 0 || estimatedVfps <= 0.0) {
+        if (videoWidth == 0) {
             blackScreenRetryCount++
             if (blackScreenRetryCount < 2) {
-                // 首次检测到"黑屏"：可能是直播流还在缓冲，3 秒后复查
-                Log.w(
-                    TAG,
-                    "Possible black screen (attempt $blackScreenRetryCount, videoWidth=$videoWidth, estimatedVfps=$estimatedVfps), retrying in 3s..."
-                )
+                // 首次检测到 videoWidth==0：可能是直播流还在缓冲，3 秒后复查
+                Log.w(TAG, "Possible black screen (attempt $blackScreenRetryCount, videoWidth=0), retrying in 3s...")
                 mpvView?.postDelayed(blackScreenCheckRunnable, 3000)
                 return@Runnable
             }
-            // 连续两次检测到黑屏，确认并非缓冲问题
-            Log.w(
-                TAG,
-                "Black screen confirmed after 2 attempts (videoWidth=$videoWidth, estimatedVfps=$estimatedVfps), fallback to mediacodec_embed"
-            )
+            // 连续两次检测到 videoWidth==0，确认解码器没工作
+            Log.w(TAG, "Black screen confirmed after 2 attempts (videoWidth=0), fallback to mediacodec_embed")
             voFallbackTriggered = true
             try {
                 MPVLib.setPropertyString("vo", "mediacodec_embed")
@@ -866,12 +932,8 @@ class MpvController : MPVLib.EventObserver, Player {
                     MPVLib.command(arrayOf("loadfile", path))
                     MPVLib.setPropertyBoolean("pause", false)
                 }
-                // 持久化 fallback 结果：下次启动直接用 mediacodec_embed，跳过黑屏探测
-                val userPrefs = UserPrefs.getInstance()
-                userPrefs.setVo("mediacodec_embed")
-                userPrefs.setHwdec("mediacodec")
-                userPrefs.setVoFallbackConfirmed(true)
-                Log.i(TAG, "Switched to vo=mediacodec_embed, hwdec=mediacodec (persisted for next launch)")
+                // 不持久化：仅本次会话生效，避免误判永久化
+                Log.i(TAG, "Switched to vo=mediacodec_embed (session only, not persisted)")
             } catch (e: Throwable) {
                 Log.e(TAG, "Fallback to mediacodec_embed failed", e)
             }
@@ -879,7 +941,7 @@ class MpvController : MPVLib.EventObserver, Player {
     }
 
     /**
-     * 安排黑屏检测（在文件加载后 6 秒执行，给直播流足够缓冲时间，避免 estimated-vfps 误判）。
+     * 安排黑屏检测（在文件加载后 6 秒执行，给直播流足够缓冲时间，避免 videoWidth 误判）。
      */
     private fun scheduleBlackScreenCheck() {
         val view = mpvView ?: return

@@ -46,6 +46,15 @@ class ClipExportService:
         # 是否请求取消
         self._cancel = False
 
+    def _tr(self, key: str, default: str) -> str:
+        """获取翻译（线程安全，LanguageManager 已用 self._lock 保护）"""
+        try:
+            if self.window and hasattr(self.window, 'language_manager'):
+                return self.window.language_manager.tr(key, default)
+        except Exception:
+            pass
+        return default
+
     def is_busy(self) -> bool:
         with self._proc_lock:
             return self._proc is not None
@@ -78,21 +87,23 @@ class ClipExportService:
         """
         if self.is_busy():
             if done_callback:
-                done_callback(False, '已有导出任务在运行')
+                done_callback(False, self._tr('clip_export_busy', '已有导出任务在运行'))
             return
         ffmpeg = _find_ffmpeg()
         if not ffmpeg:
             if done_callback:
-                done_callback(False, '未找到 ffmpeg，无法导出。请将 ffmpeg 放到 ffmpeg/ 目录或安装到系统 PATH')
+                done_callback(False, self._tr('clip_export_ffmpeg_not_found_clip',
+                    '未找到 ffmpeg，无法导出。请将 ffmpeg 放到 ffmpeg/ 目录或安装到系统 PATH'))
             return
         duration = max(0.0, end_sec - start_sec)
         if duration <= 0:
             if done_callback:
-                done_callback(False, '时长无效（end <= start）')
+                done_callback(False, self._tr('clip_export_invalid_duration', '时长无效（end <= start）'))
             return
         if not source or not os.path.exists(source):
             if done_callback:
-                done_callback(False, f'源文件不存在: {source}')
+                done_callback(False, self._tr('clip_export_source_not_found',
+                    '源文件不存在: {path}').format(path=source))
             return
         # 构造命令
         cmd = [ffmpeg, '-y', '-ss', f'{start_sec:.3f}', '-i', source,
@@ -132,27 +143,29 @@ class ClipExportService:
         """
         if self.is_busy():
             if done_callback:
-                done_callback(False, '已有导出任务在运行')
+                done_callback(False, self._tr('clip_export_busy', '已有导出任务在运行'))
             return
         ffmpeg = _find_ffmpeg()
         if not ffmpeg:
             if done_callback:
-                done_callback(False, '未找到 ffmpeg，无法生成 GIF')
+                done_callback(False, self._tr('clip_export_ffmpeg_not_found_gif', '未找到 ffmpeg，无法生成 GIF'))
             return
         try:
             from PIL import Image
         except ImportError:
             if done_callback:
-                done_callback(False, '未安装 Pillow，无法生成 GIF（pip install Pillow）')
+                done_callback(False, self._tr('clip_export_pillow_not_found',
+                    '未安装 Pillow，无法生成 GIF（pip install Pillow）'))
             return
         duration = max(0.0, end_sec - start_sec)
         if duration <= 0:
             if done_callback:
-                done_callback(False, '时长无效')
+                done_callback(False, self._tr('clip_export_invalid_duration_short', '时长无效'))
             return
         if not source or not os.path.exists(source):
             if done_callback:
-                done_callback(False, f'源文件不存在: {source}')
+                done_callback(False, self._tr('clip_export_source_not_found',
+                    '源文件不存在: {path}').format(path=source))
             return
         # 临时目录
         tmp_dir = os.path.join(os.path.dirname(output_path), f'_gif_tmp_{int(time.time())}')
@@ -187,18 +200,21 @@ class ClipExportService:
                         os.remove(output_path)
                 except Exception:
                     pass
-                self._call(done_callback, False, '已取消')
+                self._call(done_callback, False, self._tr('clip_export_cancelled', '已取消'))
                 return
             if proc.returncode == 0 and os.path.exists(output_path):
-                self._call(done_callback, True, f'已导出: {output_path}')
+                self._call(done_callback, True,
+                           self._tr('clip_export_exported', '已导出: {path}').format(path=output_path))
             else:
                 err = stderr.decode('utf-8', errors='ignore')[-500:] if stderr else '未知错误'
-                self._call(done_callback, False, f'导出失败: {err}')
+                self._call(done_callback, False,
+                           self._tr('clip_export_export_failed', '导出失败: {err}').format(err=err))
         except Exception as e:
             logger.error(f"切片导出异常: {e}")
             with self._proc_lock:
                 self._proc = None
-            self._call(done_callback, False, f'异常: {e}')
+            self._call(done_callback, False,
+                       self._tr('clip_export_exception', '异常: {err}').format(err=e))
 
     def _run_gif(self, ffmpeg, source, start_sec, duration, tmp_dir,
                  output_path, width, fps, done_callback):
@@ -223,19 +239,20 @@ class ClipExportService:
                 self._proc = None
             if self._cancel:
                 self._cleanup_tmp(tmp_dir)
-                self._call(done_callback, False, '已取消')
+                self._call(done_callback, False, self._tr('clip_export_cancelled', '已取消'))
                 return
             if proc.returncode != 0:
                 err = stderr.decode('utf-8', errors='ignore')[-500:] if stderr else '未知错误'
                 self._cleanup_tmp(tmp_dir)
-                self._call(done_callback, False, f'抽帧失败: {err}')
+                self._call(done_callback, False,
+                           self._tr('clip_export_extract_failed', '抽帧失败: {err}').format(err=err))
                 return
             # 2. 用 Pillow 合成 GIF
             from PIL import Image
             frames = sorted([f for f in os.listdir(tmp_dir) if f.endswith('.png')])
             if not frames:
                 self._cleanup_tmp(tmp_dir)
-                self._call(done_callback, False, '未抽到帧')
+                self._call(done_callback, False, self._tr('clip_export_no_frames', '未抽到帧'))
                 return
             images = []
             for fname in frames:
@@ -248,7 +265,7 @@ class ClipExportService:
                     logger.debug(f"读取帧失败 {fname}: {e}")
             if not images:
                 self._cleanup_tmp(tmp_dir)
-                self._call(done_callback, False, '读取帧失败')
+                self._call(done_callback, False, self._tr('clip_export_read_frames_failed', '读取帧失败'))
                 return
             # 保存 GIF
             try:
@@ -263,7 +280,8 @@ class ClipExportService:
                 )
             except Exception as e:
                 self._cleanup_tmp(tmp_dir)
-                self._call(done_callback, False, f'保存 GIF 失败: {e}')
+                self._call(done_callback, False,
+                           self._tr('clip_export_save_gif_failed', '保存 GIF 失败: {err}').format(err=e))
                 return
             self._cleanup_tmp(tmp_dir)
             if self._cancel:
@@ -272,15 +290,17 @@ class ClipExportService:
                         os.remove(output_path)
                 except Exception:
                     pass
-                self._call(done_callback, False, '已取消')
+                self._call(done_callback, False, self._tr('clip_export_cancelled', '已取消'))
                 return
-            self._call(done_callback, True, f'已生成: {output_path}')
+            self._call(done_callback, True,
+                       self._tr('clip_export_generated', '已生成: {path}').format(path=output_path))
         except Exception as e:
             logger.error(f"GIF 生成异常: {e}")
             self._cleanup_tmp(tmp_dir)
             with self._proc_lock:
                 self._proc = None
-            self._call(done_callback, False, f'异常: {e}')
+            self._call(done_callback, False,
+                       self._tr('clip_export_exception', '异常: {err}').format(err=e))
 
     def _cleanup_tmp(self, tmp_dir: str):
         """清理临时目录"""

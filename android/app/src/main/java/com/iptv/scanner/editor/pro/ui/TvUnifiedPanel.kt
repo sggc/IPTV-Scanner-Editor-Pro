@@ -109,6 +109,9 @@ fun TvUnifiedPanel(viewModel: AppViewModel) {
     val focusedEpgLoading by viewModel.focusedEpgLoading.collectAsState()
     val controlsPinned by viewModel.controlsPinned.collectAsState()
 
+    // 多画面状态（多画面模式下点击频道添加到副画面，而非切换主画面）
+    val multiViewState by viewModel.multiViewState.collectAsState()
+
     // 统一面板状态
     var unifiedMode by remember { mutableStateOf(UnifiedMode.CHANNELS) }
     var selectedProgram by remember { mutableStateOf<IptvEpgProgram?>(null) }
@@ -199,7 +202,14 @@ fun TvUnifiedPanel(viewModel: AppViewModel) {
                     channels = channels,
                     currentIdx = currentIdx,
                     favorites = favorites,
-                    onChannelClick = { idx -> viewModel.playChannel(idx) },
+                    onChannelClick = { idx ->
+                        // 多画面模式：点击频道添加到焦点/空闲副画面；非多画面：切换主画面
+                        if (multiViewState.active) {
+                            viewModel.addChannelToMultiView(idx)
+                        } else {
+                            viewModel.playChannel(idx)
+                        }
+                    },
                     onFocusedChannelChange = { idx -> focusedChannelIdx = idx },
                     modifier = Modifier.width(360.dp).focusRequester(column2Focus)
                 )
@@ -207,6 +217,17 @@ fun TvUnifiedPanel(viewModel: AppViewModel) {
                     viewModel = viewModel,
                     currentIdx = currentIdx,
                     isFavorite = isFavorite,
+                    multiViewActive = multiViewState.active,
+                    currentMultiViewLayout = if (multiViewState.active) multiViewState.layout else null,
+                    onEnterMultiView = { layout ->
+                        // 进入多画面：关闭统一面板，让多画面网格可见
+                        viewModel.toggleTvUnifiedPanel()
+                        viewModel.enterMultiView(layout)
+                    },
+                    onExitMultiView = {
+                        viewModel.exitMultiView()
+                        viewModel.toggleTvUnifiedPanel()
+                    },
                     onOpenPlaylist = {
                         // FileBrowserPanel 在统一面板之后渲染；SAF launcher 是系统级浮层。
                         // 两者关闭后焦点自然回到统一面板菜单项。
@@ -571,6 +592,10 @@ private fun MenuColumn(
     viewModel: AppViewModel,
     currentIdx: Int,
     isFavorite: Boolean,
+    multiViewActive: Boolean,
+    currentMultiViewLayout: MultiViewLayout?,
+    onEnterMultiView: (MultiViewLayout) -> Unit,
+    onExitMultiView: () -> Unit,
     onOpenPlaylist: () -> Unit,
     onOpenUrl: () -> Unit,
     onOpenLocalVideo: () -> Unit,
@@ -596,39 +621,61 @@ private fun MenuColumn(
 ) {
     val hasCurrentChannel = currentIdx >= 0
 
-    val menuItems = remember(hasCurrentChannel, isFavorite) {
-        listOf(
+    val menuItems = remember(hasCurrentChannel, isFavorite, multiViewActive, currentMultiViewLayout) {
+        buildList {
             // 快捷分组
-            TvMenuItem("频道列表", "订阅 / 本地 / 收藏 / 历史 / 队列", Icons.AutoMirrored.Filled.ListAlt, onChannels, highlight = true),
-            TvMenuItem("节目单 EPG", "当前频道节目 / 日期切换 / 提醒", Icons.Default.CalendarMonth, onEpg, highlight = true),
+            add(TvMenuItem("频道列表", "订阅 / 本地 / 收藏 / 历史 / 队列", Icons.AutoMirrored.Filled.ListAlt, onChannels, highlight = true))
+            add(TvMenuItem("节目单 EPG", "当前频道节目 / 日期切换 / 提醒", Icons.Default.CalendarMonth, onEpg, highlight = true))
             // 文件分组
-            TvMenuItem("打开播放列表", "选择 M3U/M3U8 文件", Icons.Default.FileOpen, onOpenPlaylist),
-            TvMenuItem("打开网络流", "输入订阅源 URL", Icons.Default.Link, onOpenUrl),
-            TvMenuItem("打开本地文件", "播放设备视频/音频文件", Icons.Default.Movie, onOpenLocalVideo),
-            TvMenuItem("订阅源管理", "添加 / 编辑 / 删除 M3U", Icons.Default.Web, onSources),
-            TvMenuItem("EPG 订阅源", "管理节目单订阅地址", Icons.Default.CalendarMonth, onEpgSources),
-            TvMenuItem("频道映射", "远程 + 用户映射管理", Icons.Default.SyncAlt, onMapping),
+            add(TvMenuItem("打开播放列表", "选择 M3U/M3U8 文件", Icons.Default.FileOpen, onOpenPlaylist))
+            add(TvMenuItem("打开网络流", "输入订阅源 URL", Icons.Default.Link, onOpenUrl))
+            add(TvMenuItem("打开本地文件", "播放设备视频/音频文件", Icons.Default.Movie, onOpenLocalVideo))
+            add(TvMenuItem("订阅源管理", "添加 / 编辑 / 删除 M3U", Icons.Default.Web, onSources))
+            add(TvMenuItem("EPG 订阅源", "管理节目单订阅地址", Icons.Default.CalendarMonth, onEpgSources))
+            add(TvMenuItem("频道映射", "远程 + 用户映射管理", Icons.Default.SyncAlt, onMapping))
             // 播放分组
-            TvMenuItem("字幕", "轨 / 显示 / 延迟 / 样式", Icons.Default.ClosedCaption, onSubtitle),
-            TvMenuItem("视频", "图像 / 旋转 / 翻转 / 3D", Icons.Default.VideoSettings, onVideo),
-            TvMenuItem("音频", "音轨 / 延迟 / EQ / 音调", Icons.Default.Equalizer, onAudio),
-            TvMenuItem("播放", "速度 / 循环 / 随机 / AB", Icons.Default.PlayCircle, onPlayback),
-            TvMenuItem("截图", "单张 / 连拍 / 含字幕", Icons.Default.ScreenshotMonitor, onScreenshot),
-            TvMenuItem("A/V 同步", "数值 / 波形 / 延迟", Icons.Default.GraphicEq, onAvsync),
-            TvMenuItem("网络增强", "Referer / Proxy / Headers", Icons.Default.Public, onNetwork),
-            TvMenuItem("工具", "搜索 / 时间线 / 提醒 / 扫描", Icons.Default.Tune, onTools),
-            TvMenuItem("视图", "视频比例 / OSD", Icons.Default.ViewInAr, onView),
-            TvMenuItem("设置", "内核 / VO / HWDEC / HDR", Icons.Default.Settings, onSettings),
-            TvMenuItem("关于", "版本 / 功能特性", Icons.Default.Info, onAbout),
-            TvMenuItem(
+            add(TvMenuItem("字幕", "轨 / 显示 / 延迟 / 样式", Icons.Default.ClosedCaption, onSubtitle))
+            add(TvMenuItem("视频", "图像 / 旋转 / 翻转 / 3D", Icons.Default.VideoSettings, onVideo))
+            add(TvMenuItem("音频", "音轨 / 延迟 / EQ / 音调", Icons.Default.Equalizer, onAudio))
+            add(TvMenuItem("播放", "速度 / 循环 / 随机 / AB", Icons.Default.PlayCircle, onPlayback))
+            add(TvMenuItem("截图", "单张 / 连拍 / 含字幕", Icons.Default.ScreenshotMonitor, onScreenshot))
+            add(TvMenuItem("A/V 同步", "数值 / 波形 / 延迟", Icons.Default.GraphicEq, onAvsync))
+            add(TvMenuItem("网络增强", "Referer / Proxy / Headers", Icons.Default.Public, onNetwork))
+            add(TvMenuItem("工具", "搜索 / 时间线 / 提醒 / 扫描", Icons.Default.Tune, onTools))
+            add(TvMenuItem("视图", "视频比例 / OSD", Icons.Default.ViewInAr, onView))
+            // 多画面分组（主画面 MPV + 副画面 ExoPlayer，规避 MPVLib 单例限制）
+            if (multiViewActive && currentMultiViewLayout != null) {
+                val otherLayout = if (currentMultiViewLayout == MultiViewLayout.DUAL) {
+                    MultiViewLayout.QUAD
+                } else {
+                    MultiViewLayout.DUAL
+                }
+                add(TvMenuItem(
+                    "切换为${otherLayout.displayName}",
+                    "当前 ${currentMultiViewLayout.displayName}",
+                    Icons.Default.ViewModule
+                ) { onEnterMultiView(otherLayout) })
+                add(TvMenuItem("退出多画面", "释放副画面 Player", Icons.AutoMirrored.Filled.ExitToApp, onExitMultiView, highlight = true))
+            } else {
+                add(TvMenuItem("双画面", "主画面 MPV + 副 ExoPlayer", Icons.Default.ViewModule) {
+                    onEnterMultiView(MultiViewLayout.DUAL)
+                })
+                add(TvMenuItem("四画面", "2x2 网格，主画面 + 3 副", Icons.Default.GridView) {
+                    onEnterMultiView(MultiViewLayout.QUAD)
+                })
+            }
+            // 系统分组
+            add(TvMenuItem("设置", "内核 / VO / HWDEC / HDR", Icons.Default.Settings, onSettings))
+            add(TvMenuItem("关于", "版本 / 功能特性", Icons.Default.Info, onAbout))
+            add(TvMenuItem(
                 if (isFavorite) "取消收藏" else "收藏",
                 if (hasCurrentChannel) "当前频道" else "未选择频道",
                 Icons.Default.Favorite,
                 onToggleFavorite,
                 highlight = hasCurrentChannel
-            ),
-            TvMenuItem("退出", "关闭应用", Icons.AutoMirrored.Filled.ExitToApp, onQuit)
-        )
+            ))
+            add(TvMenuItem("退出", "关闭应用", Icons.AutoMirrored.Filled.ExitToApp, onQuit))
+        }
     }
 
     Surface(

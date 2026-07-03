@@ -43,10 +43,13 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material.icons.filled.SyncAlt
 import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -1326,7 +1329,7 @@ fun ViewSettingsPanel(viewModel: AppViewModel) {
         SectionLabel("OSD")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
-                onClick = { mpv.showOsd("播放时间: ${"%.0f".format(mpv.timePos.value)}秒", 2000) },
+                onClick = { viewModel.showOsd("播放时间", "${"%.0f".format(mpv.timePos.value)}秒") },
                 modifier = Modifier.tvFocusBorder()
             ) {
                 Text("显示时间")
@@ -1334,7 +1337,7 @@ fun ViewSettingsPanel(viewModel: AppViewModel) {
             OutlinedButton(
                 onClick = {
                     val filename = mpv.getPropertyString("filename") ?: mpv.getPropertyString("media-title") ?: ""
-                    mpv.showOsd(filename, 3000)
+                    viewModel.showOsd("文件名", filename)
                 },
                 modifier = Modifier.tvFocusBorder()
             ) { Text("显示文件名") }
@@ -2494,7 +2497,21 @@ fun ScanPanel(viewModel: AppViewModel) {
     var timeout by remember { mutableStateOf(10) }
     var threads by remember { mutableStateOf(4) }
 
+    // 结果整理：筛选与排序
+    var validOnly by remember { mutableStateOf(false) }
+    var sortByLatency by remember { mutableStateOf(false) }
+
     val running = scanStatus?.running == true
+
+    // 应用筛选与排序
+    val displayedResults = remember(scanResults, validOnly, sortByLatency) {
+        var list = if (validOnly) scanResults.filter { it.valid } else scanResults
+        if (sortByLatency) {
+            list = list.sortedWith(compareByDescending<ScanResult> { it.latency }
+                .thenBy { it.name })
+        }
+        list
+    }
 
     PanelScaffold(
         title = "URL 范围扫描",
@@ -2623,12 +2640,61 @@ fun ScanPanel(viewModel: AppViewModel) {
 
         // 结果列表
         if (scanResults.isNotEmpty()) {
-            SectionLabel("扫描结果（${scanResults.size} 条，有效 ${scanResults.count { it.valid }}）")
+            // 工具栏：筛选 / 排序 / 导出 / 清空
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "扫描结果（${scanResults.size} 条，有效 ${scanResults.count { it.valid }}）",
+                    color = Color(0xFF4A9EFF),
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                // 筛选：仅有效
+                FilterChip(
+                    selected = validOnly,
+                    onClick = { validOnly = !validOnly },
+                    label = { Text("仅有效", fontSize = 11.sp) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Color(0xFF4A9EFF).copy(alpha = 0.3f),
+                        selectedLabelColor = Color(0xFF4A9EFF)
+                    )
+                )
+                // 排序：按延迟
+                FilterChip(
+                    selected = sortByLatency,
+                    onClick = { sortByLatency = !sortByLatency },
+                    label = { Text("按延迟", fontSize = 11.sp) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Color(0xFF4A9EFF).copy(alpha = 0.3f),
+                        selectedLabelColor = Color(0xFF4A9EFF)
+                    )
+                )
+                // 导出有效结果为 M3U
+                IconButton(
+                    onClick = { viewModel.exportScanResultsAsM3u() },
+                    modifier = Modifier.tvFocusBorder().size(32.dp)
+                ) {
+                    Icon(Icons.Default.FileDownload, contentDescription = "导出为 M3U",
+                        tint = Color(0xFF4CAF50), modifier = Modifier.size(18.dp))
+                }
+                // 清空结果
+                IconButton(
+                    onClick = { viewModel.clearScanResults() },
+                    modifier = Modifier.tvFocusBorder().size(32.dp)
+                ) {
+                    Icon(Icons.Default.DeleteOutline, contentDescription = "清空结果",
+                        tint = Color(0xFFFF5252), modifier = Modifier.size(18.dp))
+                }
+            }
             LazyColumn(
                 modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp)
             ) {
-                items(scanResults) { result ->
-                    ScanResultRow(result)
+                items(displayedResults, key = { it.url }) { result ->
+                    ScanResultRow(result, onDelete = { viewModel.deleteScanResult(result.url) })
                     HorizontalDivider(color = Color(0xFF2A2A2A))
                 }
             }
@@ -2637,7 +2703,7 @@ fun ScanPanel(viewModel: AppViewModel) {
 }
 
 @Composable
-private fun ScanResultRow(result: ScanResult) {
+private fun ScanResultRow(result: ScanResult, onDelete: () -> Unit = {}) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -2672,8 +2738,9 @@ private fun ScanResultRow(result: ScanResult) {
                 if (result.latency > 0) {
                     Text("${result.latency}ms", color = Color(0xFF888888), fontSize = 11.sp)
                 }
-                if (result.group.isNotEmpty()) {
-                    Text(result.group, color = Color(0xFF888888), fontSize = 11.sp)
+                if (result.status.isNotEmpty()) {
+                    Text(result.status, color = Color(0xFF888888), fontSize = 11.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
             Text(
@@ -2684,6 +2751,14 @@ private fun ScanResultRow(result: ScanResult) {
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 2.dp)
             )
+        }
+        // 删除单条结果
+        IconButton(
+            onClick = onDelete,
+            modifier = Modifier.tvFocusBorder().size(28.dp)
+        ) {
+            Icon(Icons.Default.Close, contentDescription = "删除",
+                tint = Color(0xFF888888), modifier = Modifier.size(16.dp))
         }
     }
 }

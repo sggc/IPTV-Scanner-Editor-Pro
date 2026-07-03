@@ -11,8 +11,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Refresh
@@ -32,6 +31,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -122,64 +122,63 @@ fun StreamQualityPanel(viewModel: AppViewModel) {
             // tick 作为 remember key 触发重新读取 mpv 属性
             val info = remember(tick, fileLoaded) { readStreamInfo(mpv) }
 
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
+            // TV 端：使用 LazyColumn + 可聚焦子项，方向键可逐行聚焦并触发滚动
+            LazyColumn(
+                modifier = Modifier.fillMaxSize()
             ) {
                 // 视频信息
-                SectionLabel("视频")
-                InfoRow("编解码器", info.videoCodec)
-                InfoRow("分辨率", info.resolution)
-                InfoRow("显示分辨率", info.displayResolution)
-                InfoRow("帧率", info.fps)
-                InfoRow("视频码率", info.videoBitrate)
-                InfoRow("像素格式", info.pixelFormat)
-                InfoRow("色彩矩阵", info.colormatrix)
-                InfoRow("色彩原色", info.primaries)
-                InfoRow("传输特性", info.gamma)
-                InfoRow("HDR 类型", info.hdrType)
-                InfoRow("视频位深", info.videoDepth)
-                InfoRow("宽高比", info.aspectRatio)
+                item { SectionLabel("视频") }
+                item { InfoRow("编解码器", info.videoCodec) }
+                item { InfoRow("分辨率", info.resolution) }
+                item { InfoRow("显示分辨率", info.displayResolution) }
+                item { InfoRow("帧率", info.fps) }
+                item { InfoRow("视频码率", info.videoBitrate) }
+                item { InfoRow("像素格式", info.pixelFormat) }
+                item { InfoRow("色彩矩阵", info.colormatrix) }
+                item { InfoRow("色彩原色", info.primaries) }
+                item { InfoRow("传输特性", info.gamma) }
+                item { InfoRow("HDR 类型", info.hdrType) }
+                item { InfoRow("视频位深", info.videoDepth) }
+                item { InfoRow("宽高比", info.aspectRatio) }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                item { Spacer(modifier = Modifier.height(16.dp)) }
 
                 // 音频信息
-                SectionLabel("音频")
-                InfoRow("编解码器", info.audioCodec)
-                InfoRow("声道数", info.audioChannels)
-                InfoRow("声道布局", info.audioLayout)
-                InfoRow("采样率", info.sampleRate)
-                InfoRow("音频码率", info.audioBitrate)
-                InfoRow("音频位深", info.audioDepth)
+                item { SectionLabel("音频") }
+                item { InfoRow("编解码器", info.audioCodec) }
+                item { InfoRow("声道数", info.audioChannels) }
+                item { InfoRow("声道布局", info.audioLayout) }
+                item { InfoRow("采样率", info.sampleRate) }
+                item { InfoRow("音频码率", info.audioBitrate) }
+                item { InfoRow("音频位深", info.audioDepth) }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                item { Spacer(modifier = Modifier.height(16.dp)) }
 
                 // 网络与缓存
-                SectionLabel("网络与缓存")
-                InfoRow("容器格式", info.container)
-                InfoRow("协议", info.protocol)
-                InfoRow("解复用器", info.demuxer)
-                InfoRow("缓存时长", info.cacheDuration)
-                InfoRow("缓存大小", info.cacheSize)
-                InfoRow("缓存速度", info.cacheSpeed)
-                InfoRow("缓冲状态", info.buffering)
-                InfoRow("解复用码率", info.demuxerBitrate)
+                item { SectionLabel("网络与缓存") }
+                item { InfoRow("容器格式", info.container) }
+                item { InfoRow("协议", info.protocol) }
+                item { InfoRow("解复用器", info.demuxer) }
+                item { InfoRow("缓存时长", info.cacheDuration) }
+                item { InfoRow("缓存大小", info.cacheSize) }
+                item { InfoRow("缓存速度", info.cacheSpeed) }
+                item { InfoRow("缓冲状态", info.buffering) }
+                item { InfoRow("解复用码率", info.demuxerBitrate) }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                item { Spacer(modifier = Modifier.height(16.dp)) }
 
                 // 丢帧统计
-                SectionLabel("丢帧统计")
-                InfoRow("VO 丢帧", info.voDropCount)
-                InfoRow("解码器丢帧", info.decoderDropCount)
-                InfoRow("音视频偏差", info.avdiff)
+                item { SectionLabel("丢帧统计") }
+                item { InfoRow("VO 丢帧", info.voDropCount) }
+                item { InfoRow("解码器丢帧", info.decoderDropCount) }
+                item { InfoRow("音视频偏差", info.avdiff) }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                item { Spacer(modifier = Modifier.height(16.dp)) }
 
                 // 硬件与渲染
-                SectionLabel("硬件与渲染")
-                InfoRow("硬解", info.hwdec)
-                InfoRow("视频输出", info.vo)
+                item { SectionLabel("硬件与渲染") }
+                item { InfoRow("硬解", info.hwdec) }
+                item { InfoRow("视频输出", info.vo) }
             }
         }
     }
@@ -363,6 +362,8 @@ private fun InfoRow(label: String, value: String) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .tvFocusBorder()
+            .focusable()
             .padding(vertical = 3.dp),
         horizontalArrangement = Arrangement.SpaceBetween
     ) {

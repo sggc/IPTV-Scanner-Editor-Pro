@@ -135,45 +135,6 @@ object FccHelper {
             sock?.close()
         }
     }
-
-    /**
-     * 从 URL 中提取原始播放地址（去除 FCC 代理参数）。
-     *
-     * 处理两种 URL 格式：
-     * 1. HTTP/HTTPS 代理 URL：http://proxy/rtp/239.1.1.1:5002?fcc=150.138.8.132:8027
-     *    → 直接返回原 URL（保留 ?fcc= 参数，由 rt2phttpd 代理在服务端处理 FCC）
-     *
-     *    rt2phttpd 通过 HTTP 请求的 ?fcc= 查询参数在服务端侧完成 IGMP leave/join，
-     *    快速转发新频道流。客户端无需剥离该参数；若剥离则代理无法识别 FCC 需求，
-     *    退化为普通组播转发，FCC 不生效。
-     *
-     * 2. 直接 RTP/UDP URL：rtp://239.1.1.1:5002?fcc=150.138.8.132:8027
-     *    → 返回 rtp://239.1.1.1:5002（去除 ?fcc= 查询参数，mpv 不理解该参数）
-     *
-     * 与 PC 端 mpv_player_service.py _extract_original_url() 对齐。
-     * PC 端该函数当前未被调用（直接把完整 URL 传给 mpv），但保持逻辑一致以便维护。
-     */
-    fun extractOriginalUrl(url: String): String {
-        // HTTP/HTTPS URL：直接返回原 URL（保留 ?fcc= 参数，由 rt2phttpd 代理处理 FCC）
-        if (url.startsWith("http://", ignoreCase = true) ||
-            url.startsWith("https://", ignoreCase = true)) {
-            return url
-        }
-
-        // 直接 RTP/UDP URL：去除 ?fcc= 查询参数（mpv 不理解该参数）
-        val fccIdx = url.indexOf("?fcc=", ignoreCase = true)
-        if (fccIdx < 0) return url
-
-        // 检查是否有其他查询参数（&）
-        val ampIdx = url.indexOf('&', fccIdx)
-        return if (ampIdx >= 0) {
-            // 有其他参数：保留 ? 和其他参数，去掉 fcc= 部分
-            url.substring(0, fccIdx) + "?" + url.substring(ampIdx + 1)
-        } else {
-            // 只有 fcc 参数：去掉整个 query
-            url.substring(0, fccIdx)
-        }
-    }
 }
 
 /**

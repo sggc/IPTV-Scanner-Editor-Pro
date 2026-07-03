@@ -282,6 +282,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     // -----------------------------------------------------------------
+    // 多画面状态（TV 端多画面功能）
+    //
+    // 主画面（index=0）用 _player（通常为 MPV，功能最全），
+    // 副画面（index=1+）用 ExoPlayer（多实例支持）。
+    // MPV 在安卓端是单例（mpv-android 库限制），副画面不能用 MPV。
+    // -----------------------------------------------------------------
+    private val _multiViewState = MutableStateFlow(MultiViewState())
+    val multiViewState: StateFlow<MultiViewState> = _multiViewState.asStateFlow()
+
+    /** 副画面 Player 实例（index -> Player，主画面用 _player） */
+    private val subPlayers = mutableMapOf<Int, Player>()
+
+    /** 获取副画面 Player 实例（供 MultiViewOverlay 创建 ExoPlayerView 时绑定） */
+    fun getSubPlayerForMultiView(viewportIndex: Int): Player? = subPlayers[viewportIndex]
+
+    // -----------------------------------------------------------------
     // 频道列表面板状态
     // -----------------------------------------------------------------
     enum class ChannelTab { SUB, LOCAL, FAV, HIST, QUEUE }
@@ -1037,8 +1053,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // 与 PC 端 PlaybackController.play_channel() → fcc.on_channel_change() 对齐。
         fccService.onChannelChange(channel.url)
 
-        // 播放（HTTP 代理 URL 保留 ?fcc= 由 rt2phttpd 处理；直接 RTP/UDP URL 去除 ?fcc=）
-        val playUrl = FccHelper.extractOriginalUrl(channel.url)
+        // 播放：URL 原样传给 mpv。?fcc= 参数只是一个标记，指定 FCC 代理地址，
+        // mpv/ffmpeg 会忽略不认识的查询参数，rt2phttpd 代理则通过该参数处理 FCC。
+        val playUrl = channel.url
 
         // 协议兼容性检查：IJK/ExoPlayer 不支持 RTP/UDP 等非 HTTP 协议。
         // 遇到不支持的协议时自动切换到 MPV（支持全部协议），避免播放失败无响应。
@@ -1069,6 +1086,233 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
         // 预取 EPG（避免用户必须先打开 EPG 面板才能看到节目信息）
         fetchEpgForCurrent()
+    }
+
+    // -----------------------------------------------------------------
+    // 多画面控制
+    //
+    // 主画面（index=0）用当前播放器（通常 MPV，功能最全）
+    // 副画面（index=1+）用 ExoPlayer（多实例支持，MPV 安卓端单例限制）
+    // 副画面默认静音，只有主画面有声音
+    // -----------------------------------------------------------------
+
+    /**
+     * 进入多画面模式。
+     *
+     * - 主画面（index=0）保留当前播放的频道
+     * - 副画面（index=1+）初始化为空画面，等待用户添加频道
+     * - 副画面 Player 用 ExoPlayerController（多实例支持）
+     *
+     * @param layout 布局模式（DUAL/QUAD）
+     */
+    fun enterMultiView(layout: MultiViewLayout = MultiViewLayout.DUAL) {
+        if (_multiViewState.value.active) {
+            switchMultiViewLayout(layout)
+            return
+        }
+        val primaryIdx = _currentIdx.value
+        val primaryName = currentChannel.value?.name ?: ""
+        if (primaryIdx < 0) {
+            showOsd("多画面", "请先选择一个频道")
+            return
+        }
+        _multiViewState.value = MultiViewState.create(layout, primaryIdx, primaryName)
+        closeAllPanels()
+        // 隐藏控制层，让多画面网格完整可见（用户按 CENTER 可重新显示控制层）
+        hideControls()
+        showOsd("多画面", "已进入${layout.displayName}模式")
+    }
+
+    /**
+     * 退出多画面模式。释放所有副画面 Player，主画面保持播放。
+     */
+    fun exitMultiView() {
+        if (!_multiViewState.value.active) return
+        subPlayers.values.forEach { player ->
+            try { player.stop(); player.detach() } catch (e: Throwable) {
+                Log.w(TAG, "release sub player failed: ${e.message}")
+            }
+        }
+        subPlayers.clear()
+        _multiViewState.value = MultiViewState()
+        // 退出多画面后显示控制层（自动隐藏），让用户看到操作选项
+        showControlsAutoHide()
+        showOsd("多画面", "已退出多画面模式")
+    }
+
+    /**
+     * 切换多画面布局。扩展布局新增空视口，缩小布局先释放被移除视口的 Player。
+     */
+    fun switchMultiViewLayout(layout: MultiViewLayout) {
+        val current = _multiViewState.value
+        if (!current.active || current.layout == layout) return
+        if (layout.count < current.viewports.size) {
+            for (i in layout.count until current.viewports.size) {
+                subPlayers.remove(i)?.let { player ->
+                    try { player.stop(); player.detach() } catch (e: Throwable) {}
+                }
+            }
+        }
+        val newViewports = (0 until layout.count).map { i ->
+            current.viewports.getOrNull(i) ?: MultiViewport(index = i)
+        }
+        _multiViewState.value = current.copy(layout = layout, viewports = newViewports)
+        showOsd("多画面", "已切换到${layout.displayName}")
+    }
+
+    /**
+     * 添加频道到多画面。
+     *
+     * 优先添加到焦点视口（如果为空且非主画面），否则添加到第一个空闲视口。
+     * 主画面（index=0）的频道切换走 [playChannel]，不在此处理。
+     *
+     * @return 目标视口索引，-1 表示无可用视口
+     */
+    fun addChannelToMultiView(channelIdx: Int): Int {
+        val state = _multiViewState.value
+        if (!state.active) return -1
+        val channel = _channels.value.getOrNull(channelIdx) ?: return -1
+
+        val focused = state.focusedViewport
+        val targetViewport = if (focused != null && focused.isEmpty && !focused.isPrimary) {
+            focused
+        } else {
+            state.firstEmptyViewport ?: run {
+                showOsd("多画面", "画面已满，请先关闭一个画面")
+                return -1
+            }
+        }
+        val targetIdx = targetViewport.index
+
+        // 主画面的频道切换走 playChannel
+        if (targetIdx == 0) {
+            playChannel(channelIdx)
+            return 0
+        }
+
+        // 副画面：协议兼容性检查（ExoPlayer 不支持 RTP/UDP/RTSP）
+        val playUrl = channel.url
+        if (!isUrlSupportedByPlayer(playUrl, PlayerType.EXO)) {
+            val errorViewport = targetViewport.copy(
+                channelIdx = channelIdx,
+                channelName = channel.name,
+                isError = true,
+                errorMessage = "协议不支持"
+            )
+            _multiViewState.value = state.copy(
+                viewports = state.viewports.map { if (it.index == targetIdx) errorViewport else it }
+            )
+            showOsd("多画面", "${channel.name}: ExoPlayer 不支持此协议")
+            return targetIdx
+        }
+
+        // 创建或复用副画面 Player
+        val player = subPlayers.getOrPut(targetIdx) {
+            ExoPlayerController(getApplication()).also { newPlayer ->
+                observeSubPlayerError(newPlayer, targetIdx)
+            }
+        }
+
+        // 标记视口为播放中
+        val newViewport = targetViewport.copy(
+            channelIdx = channelIdx,
+            channelName = channel.name,
+            isError = false,
+            errorMessage = ""
+        )
+        _multiViewState.value = state.copy(
+            viewports = state.viewports.map { if (it.index == targetIdx) newViewport else it },
+            focusedIndex = targetIdx
+        )
+
+        // 副画面静音（只有主画面有声音）
+        player.setMute(true)
+        player.playFile(playUrl)
+
+        Log.i(TAG, "addChannelToMultiView: ${channel.name} -> viewport $targetIdx")
+        showOsd("多画面", "${channel.name} 已添加到画面 ${targetIdx + 1}")
+        return targetIdx
+    }
+
+    /**
+     * 从多画面移除视口（清空频道）。主画面不能移除（用 [exitMultiView] 退出）。
+     */
+    fun removeFromMultiView(viewportIndex: Int) {
+        val state = _multiViewState.value
+        if (!state.active || viewportIndex == 0) return
+        subPlayers.remove(viewportIndex)?.let { player ->
+            try { player.stop(); player.detach() } catch (e: Throwable) {}
+        }
+        val newViewports = state.viewports.map { vp ->
+            if (vp.index == viewportIndex) MultiViewport(index = viewportIndex) else vp
+        }
+        _multiViewState.value = state.copy(viewports = newViewports)
+    }
+
+    /**
+     * 设置焦点视口（TV 端 D-pad 切换焦点）。
+     */
+    fun setFocusedViewport(viewportIndex: Int) {
+        val state = _multiViewState.value
+        if (!state.active) return
+        if (viewportIndex !in state.viewports.indices) return
+        _multiViewState.value = state.copy(focusedIndex = viewportIndex)
+    }
+
+    /**
+     * 多画面模式下焦点视口切换（TV 端 D-pad）。
+     * @param direction 0=左 1=上 2=右 3=下
+     * @return true 表示焦点已切换
+     */
+    fun moveMultiViewFocus(direction: Int): Boolean {
+        val state = _multiViewState.value
+        if (!state.active) return false
+        val current = state.focusedIndex
+        val newIdx = when (state.layout) {
+            MultiViewLayout.DUAL -> when (direction) {
+                0, 2 -> if (current == 0) 1 else 0  // 左右切换
+                else -> return false  // 双画面不支持上下
+            }
+            MultiViewLayout.QUAD -> {
+                // 2x2 网格：0 1
+                //          2 3
+                val row = current / 2
+                val col = current % 2
+                when (direction) {
+                    0 -> if (col == 0) return false else current - 1  // 左
+                    1 -> if (row == 0) return false else current - 2  // 上
+                    2 -> if (col == 1) return false else current + 1  // 右
+                    3 -> if (row == 1) return false else current + 2  // 下
+                    else -> return false
+                }
+            }
+            MultiViewLayout.SINGLE -> return false
+        }
+        if (newIdx !in state.viewports.indices) return false
+        setFocusedViewport(newIdx)
+        return true
+    }
+
+    /**
+     * 监听副画面 Player 的错误状态，同步到视口状态。
+     */
+    private fun observeSubPlayerError(player: Player, viewportIndex: Int) {
+        if (player is ExoPlayerController) {
+            viewModelScope.launch {
+                player.lastError.collect { error ->
+                    if (error.isNotEmpty()) {
+                        val state = _multiViewState.value
+                        if (!state.active) return@collect
+                        val newViewports = state.viewports.map { vp ->
+                            if (vp.index == viewportIndex) {
+                                vp.copy(isError = true, errorMessage = error)
+                            } else vp
+                        }
+                        _multiViewState.value = state.copy(viewports = newViewports)
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -2449,6 +2693,68 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         scanPollJob = null
     }
 
+    /**
+     * 删除单条扫描结果（仅前端列表，不影响已添加到频道列表的有效频道）。
+     * 用于扫描完成后整理结果。
+     */
+    fun deleteScanResult(url: String) {
+        _scanResults.value = _scanResults.value.filterNot { it.url == url }
+    }
+
+    /** 清空所有扫描结果（仅前端列表） */
+    fun clearScanResults() {
+        _scanResults.value = emptyList()
+    }
+
+    /**
+     * 将扫描结果中的有效频道导出为 M3U 文件，保存到 Downloads 目录。
+     * 调用后端 get_m3u_text(group="扫描结果", validOnly=true) 获取 M3U 文本。
+     */
+    fun exportScanResultsAsM3u() {
+        viewModelScope.launch {
+            try {
+                val resp = repository.getM3uText(group = "扫描结果", validOnly = true).getOrNull()
+                if (resp == null || resp.text.isEmpty()) {
+                    showOsd("导出", "无有效频道可导出")
+                    return@launch
+                }
+                val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.CHINA)
+                    .format(java.util.Date())
+                val filename = "scan_$ts.m3u"
+                val app = getApplication<Application>()
+                val written = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val resolver = app.contentResolver
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                        put(MediaStore.MediaColumns.MIME_TYPE, "audio/x-mpegurl")
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    }
+                    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    if (uri == null) false
+                    else {
+                        resolver.openOutputStream(uri)?.use { it.write(resp.text.toByteArray()) } ?: false
+                        true
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    if (!dir.exists()) dir.mkdirs()
+                    File(dir, filename).writeText(resp.text)
+                    true
+                }
+                if (written) {
+                    showOsd("导出", "已保存到 Downloads/$filename（${resp.count} 个频道）")
+                    Log.i(TAG, "Scan results exported to Downloads/$filename (${resp.count} channels)")
+                } else {
+                    showOsd("导出", "保存失败")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "exportScanResultsAsM3u failed", e)
+                showOsd("导出", "导出失败: ${e.message}")
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // 节目提醒管理（与 PC 端 controllers/epg_reminder_controller.py 对齐）
     //
@@ -2957,7 +3263,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 加载时间线数据：按 [EpgTimelineRange] 筛选频道（最多 30 个），
+     * 加载时间线数据：按 [EpgTimelineRange] 筛选频道（显示所有频道），
      * 复用 [epgCache]，按选中日期过滤节目。
      */
     fun loadEpgTimeline() {
@@ -2977,7 +3283,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (group.isEmpty()) channels
                 else channels.filter { it.group == group }
             }
-        }.take(30)
+        }
 
         if (selectedChannels.isEmpty()) {
             _epgTimelineStatus.value = "所选范围无频道"
@@ -4635,6 +4941,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         subSyncJob?.cancel()
         reminderCheckJob?.cancel()
         resumeSaveJob?.cancel()
+        // 清理多画面副画面 Player（避免 ExoPlayer 实例泄漏）
+        subPlayers.values.forEach { player ->
+            try { player.stop(); player.detach() } catch (_: Throwable) {}
+        }
+        subPlayers.clear()
         // 清理 APK 下载资源（避免 receiver 泄漏）
         try {
             apkProgressJob?.cancel()

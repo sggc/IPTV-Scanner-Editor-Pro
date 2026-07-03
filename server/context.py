@@ -122,17 +122,53 @@ class StandaloneScanner:
                 name = u.split('/')[-1] or u.split('://')[-1] or u
                 import time as _t
                 t0 = _t.time()
-                # HTTP/HTTPS：用 HEAD 请求验证可达性
+                # HTTP/HTTPS：用 GET stream 验证可达性（HEAD 很多 IPTV 服务器不支持）
                 if low.startswith('http://') or low.startswith('https://'):
                     try:
-                        r = _requests.head(u, timeout=timeout, allow_redirects=True,
-                                           headers={'User-Agent': 'IPTV-Scanner/1.0'})
+                        # GET + Range（只读前 2KB，避免下载整个流）
+                        r = _requests.get(u, timeout=timeout, allow_redirects=True,
+                                          headers={'User-Agent': 'IPTV-Scanner/1.0',
+                                                   'Range': 'bytes=0-2047'},
+                                          stream=True)
                         latency = int((_t.time() - t0) * 1000)
-                        if r.status_code < 400:
-                            ch = {'name': name, 'url': u, 'group': '扫描结果', 'logo': '',
-                                  'tvg_id': '', 'tvg_name': name, 'valid': True}
-                            return (u, True, f'HTTP {r.status_code}', latency, ch)
-                        return (u, False, f'HTTP {r.status_code}', latency, None)
+                        status_code = r.status_code
+                        # 2xx / 3xx / 206（Partial Content）视为可达
+                        if status_code < 400:
+                            # 读取前 2KB 检查是否为有效媒体内容
+                            content_type = r.headers.get('Content-Type', '').lower()
+                            chunk = b''
+                            try:
+                                chunk = next(r.iter_content(2048), b'') or b''
+                            except Exception:
+                                pass
+                            try: r.close()
+                            except: pass
+                            # 判断内容类型
+                            is_media = False
+                            media_kind = ''
+                            # 1. Content-Type 为媒体类型
+                            if any(t in content_type for t in
+                                   ('video/', 'audio/', 'mpegurl', 'm3u', 'octet-stream', 'mp2t')):
+                                is_media = True
+                                media_kind = content_type.split(';')[0].strip()
+                            # 2. M3U/M3U8 文本特征
+                            elif chunk[:7] == b'#EXTM3U' or b'#EXT-X' in chunk[:2048]:
+                                is_media = True
+                                media_kind = 'm3u/m3u8'
+                            # 3. MPEG-TS 同步字节 0x47（每 188 字节一个）
+                            elif len(chunk) >= 188 and chunk[0] == 0x47:
+                                is_media = True
+                                media_kind = 'mpeg-ts'
+                            # 4. 任意 2xx 响应都视为可达（保守策略，避免漏报）
+                            else:
+                                is_media = True
+                                media_kind = f'HTTP {status_code}'
+                            if is_media:
+                                ch = {'name': name, 'url': u, 'group': '扫描结果', 'logo': '',
+                                      'tvg_id': '', 'tvg_name': name, 'valid': True}
+                                return (u, True, media_kind, latency, ch)
+                            return (u, False, f'HTTP {status_code} 非媒体', latency, None)
+                        return (u, False, f'HTTP {status_code}', latency, None)
                     except Exception as e:
                         latency = int((_t.time() - t0) * 1000)
                         return (u, False, f'错误: {str(e)[:60]}', latency, None)

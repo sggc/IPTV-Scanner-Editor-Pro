@@ -204,6 +204,14 @@ class MPVView @JvmOverloads constructor(
     private var voInUse: String = DEFAULT_VO
 
     /**
+     * Surface 重建后重新 loadfile 时需恢复的播放位置（秒）。
+     * 由 surfaceCreated 设置，MpvController 在 FILE_LOADED 事件中读取并 seek。
+     * -1.0 表示不需要恢复（直播流或未播放）。
+     */
+    @Volatile
+    var pendingResumePos: Double = -1.0
+
+    /**
      * 更新 voInUse（运行时切换 vo 时调用）。
      * 下次 surfaceCreated 时会用新 vo 设置 mpv，确保 surface 重建后渲染正确。
      */
@@ -254,6 +262,24 @@ class MPVView @JvmOverloads constructor(
             MPVLib.command(arrayOf("loadfile", filePath as String))
             MPVLib.setPropertyBoolean("pause", false)
             filePath = null
+        } else {
+            // 正常播放中 Surface 重建（如 PiP 切换、Activity 恢复）：
+            // vo=gpu 在 Surface 重建后 EGL 渲染上下文可能未正确恢复，导致花屏。
+            // 重新 loadfile 当前路径触发 vo 完整重初始化（切频道能恢复也是因为 loadfile）。
+            // 保留播放位置（本地文件）和暂停状态；直播流 time-pos 为 0 不 seek，从最新位置播放。
+            try {
+                val currentPath = MPVLib.getPropertyString("path")
+                if (currentPath != null && currentPath.isNotEmpty()) {
+                    val wasPaused = try { MPVLib.getPropertyBoolean("pause") } catch (e: Throwable) { false }
+                    val pos = try { MPVLib.getPropertyDouble("time-pos") } catch (e: Throwable) { -1.0 }
+                    Log.i(TAG, "surfaceCreated: Surface rebuilt during playback, reloading '$currentPath' (pos=$pos, paused=$wasPaused)")
+                    pendingResumePos = if (pos > 0) pos else -1.0
+                    MPVLib.command(arrayOf("loadfile", currentPath))
+                    MPVLib.setPropertyBoolean("pause", wasPaused)
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "surfaceCreated: reload current path failed: ${e.message}")
+            }
         }
     }
 

@@ -516,34 +516,6 @@ class MpvPlayerController(QObject):
             return -1
         return _mpv_set_property_string(self.mpv_handle, name, str(value))
 
-    def _extract_original_url(self, url):
-        """从 URL 中提取原始播放地址（去除 FCC 代理参数）。
-
-        处理两种 URL 格式：
-        1. HTTP/HTTPS 代理 URL：http://proxy/rtp/239.1.1.1:5002?fcc=...
-           → 直接返回原 URL（保留 ?fcc= 参数，由 rt2phttpd 代理在服务端处理 FCC）
-        2. 直接 RTP/UDP URL：rtp://239.1.1.1:5002?fcc=...
-           → 返回 rtp://239.1.1.1:5002（去除 ?fcc= 查询参数，mpv 不理解该参数）
-
-        注意：此方法当前为备用实现，未被调用。PC 端直接把完整 URL 传给 mpv，
-        由 rt2phttpd 代理通过 ?fcc= 参数在服务端处理 FCC。保持逻辑与 Android 端
-        FccHelper.extractOriginalUrl() 一致以便维护。
-        """
-        # HTTP/HTTPS URL：直接返回原 URL（保留 ?fcc= 参数，由 rt2phttpd 代理处理 FCC）
-        if url.lower().startswith(('http://', 'https://')):
-            return url
-
-        # 直接 RTP/UDP URL：去除 ?fcc= 查询参数（mpv 不理解该参数）
-        url_lower = url.lower()
-        fcc_idx = url_lower.find('?fcc=')
-        if fcc_idx < 0:
-            return url
-
-        amp_idx = url.find('&', fcc_idx)
-        if amp_idx >= 0:
-            return url[:fcc_idx] + '?' + url[amp_idx + 1:]
-        return url[:fcc_idx]
-
 
     def _is_network_url(self, url):
         if not url:
@@ -659,7 +631,7 @@ class MpvPlayerController(QObject):
             return url
         u = url.lower()
         is_network = (u.startswith(('http://', 'https://', 'rtmp://', 'rtsp://', 'rtp://', 'udp://', 'file://')) or
-                      u.endswith('.m3u8'))
+                      '.m3u8' in u)
         if is_network:
             return url
         if self._is_network_drive(url):
@@ -783,7 +755,7 @@ class MpvPlayerController(QObject):
                 return
             u = url.lower()
             is_network = (u.startswith(('http://', 'https://', 'rtmp://', 'rtsp://', 'rtp://', 'udp://')) or
-                          u.endswith('.m3u8'))
+                          '.m3u8' in u)
             is_net_drive = not is_network and self._is_network_drive(url)
             if not is_network and not is_net_drive:
                 return
@@ -875,7 +847,7 @@ class MpvPlayerController(QObject):
         u = url.lower()
 
         is_network = (u.startswith(('http://', 'https://', 'rtmp://', 'rtsp://', 'rtp://', 'udp://')) or
-                      u.endswith('.m3u8'))
+                      '.m3u8' in u)
         if u.startswith('bd://'):
             self._setup_bluray_options()
             return
@@ -948,7 +920,7 @@ class MpvPlayerController(QObject):
             self.logger.debug(f"[mpv] ts demux=mpegts cache={cache_secs}s back={max_bytes_mib}MiB dur={program_duration}s")
             return
 
-        if u.endswith('.m3u8') or 'format=hls' in u:
+        if '.m3u8' in u or 'format=hls' in u:
             self._set_mpv_string('demuxer-lavf-format', '')
             self._set_mpv_string('cache', 'yes')
             self._set_mpv_string('cache-secs', str(cache_secs))

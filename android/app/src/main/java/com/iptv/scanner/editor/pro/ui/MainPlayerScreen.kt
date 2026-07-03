@@ -39,6 +39,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.movableContentOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -112,6 +114,9 @@ fun MainPlayerScreen(viewModel: AppViewModel) {
     val videoHeight by player.videoHeight.collectAsState()
     val fileLoaded by player.fileLoaded.collectAsState()
 
+    // 多画面状态
+    val multiViewState by viewModel.multiViewState.collectAsState()
+
     // 文件加载完成时触发续播位置恢复（与 PC 端 _on_file_loaded 对齐）
     // 同时应用 HDR 配置（与 PC 端 _apply_hdr_on_file_loaded 对齐）
     LaunchedEffect(fileLoaded) {
@@ -172,85 +177,98 @@ fun MainPlayerScreen(viewModel: AppViewModel) {
         // 用 key(playerType) 强制在切换播放器时重建 View（AndroidView 的 factory 不会因
         // state 变化重新执行，必须用 key 包裹才能销毁旧 View 创建新 View）。
         //
-        // 关键：不用 fillMaxSize！用 aspectRatio 让 SurfaceView 尺寸匹配视频比例。
-        // 这样 Surface buffer 尺寸 = 视频比例尺寸，MediaCodec 不会拉伸视频。
-        // SurfaceView 居中显示，上下/左右黑边由根 Box 的黑色背景提供。
+        // 单画面模式：用 aspectRatio 让 SurfaceView 尺寸匹配视频比例，居中显示。
+        // 多画面模式：主画面用 fillMaxSize 填满网格 cell，副画面用 ExoPlayer（多实例）。
         // -----------------------------------------------------------------
-        key(playerType) {
-            AndroidView(
-                factory = { ctx ->
-                    Log.i("MainPlayerScreen", "Creating player view, playerType=$playerType, uiMode=$uiMode")
-                    when (playerType) {
-                        PlayerType.MPV -> {
-                            // MPVView 需要先 initialize(configDir, cacheDir, vo, hwdec) 创建 mpv 实例
-                            // 再 attach 到 MpvController（注册 EventObserver 转发事件到 StateFlow）
-                            val mpvView = MPVView(ctx)
-                            val configDir = ctx.getDir("mpv_config", Context.MODE_PRIVATE).absolutePath
-                            val cacheDir = ctx.cacheDir.absolutePath
-                            // 从 UserPrefs 读取持久化的 vo/hwdec：
-                            // - 首次安装用默认值 gpu/auto-copy
-                            // - 黑屏 fallback 成功后持久化为 mediacodec_embed，下次直接用，跳过黑屏探测
-                            val userPrefs = UserPrefs.getInstance()
-                            val vo = userPrefs.getVo()
-                            val hwdec = userPrefs.getHwdec()
-                            try {
-                                mpvView.initialize(configDir, cacheDir, vo = vo, hwdec = hwdec)
-                                // 绑定 Player（attachView 转发到 MpvController.attach）
-                                player.attachView(mpvView)
-                                Log.i("MainPlayerScreen", "MPVView initialized (vo=$vo, hwdec=$hwdec) + attached")
-                            } catch (e: Throwable) {
-                                Log.e("MainPlayerScreen", "MPVView initialize failed", e)
-                            }
-                            // 切换播放器后的状态恢复（consumePendingRestore 返回非 null 表示有待恢复状态）
-                            viewModel.consumePendingRestore()?.let { (url, time) ->
-                                Log.i("MainPlayerScreen", "Restoring playback: $url @ ${time}s")
-                                player.restorePlaybackState(url, time)
-                            }
-                            mpvView
-                        }
-                        PlayerType.EXO -> {
-                            val exoView = ExoPlayerView(ctx)
-                            player.attachView(exoView)
-                            viewModel.consumePendingRestore()?.let { (url, time) ->
-                                Log.i("MainPlayerScreen", "Restoring playback (Exo): $url @ ${time}s")
-                                player.restorePlaybackState(url, time)
-                            }
-                            exoView
-                        }
-                        PlayerType.VLC -> {
-                            val vlcView = VlcVideoView(ctx)
-                            player.attachView(vlcView)
-                            viewModel.consumePendingRestore()?.let { (url, time) ->
-                                Log.i("MainPlayerScreen", "Restoring playback (VLC): $url @ ${time}s")
-                                player.restorePlaybackState(url, time)
-                            }
-                            vlcView
-                        }
-                        PlayerType.IJK -> {
-                            val ijkView = IjkVideoView(ctx)
-                            player.attachView(ijkView)
-                            viewModel.consumePendingRestore()?.let { (url, time) ->
-                                Log.i("MainPlayerScreen", "Restoring playback (IJK): $url @ ${time}s")
-                                player.restorePlaybackState(url, time)
-                            }
-                            ijkView
-                        }
+        val createPlayerView: (android.content.Context) -> android.view.View = { ctx ->
+            Log.i("MainPlayerScreen", "Creating player view, playerType=$playerType, uiMode=$uiMode")
+            when (playerType) {
+                PlayerType.MPV -> {
+                    val mpvView = MPVView(ctx)
+                    val configDir = ctx.getDir("mpv_config", Context.MODE_PRIVATE).absolutePath
+                    val cacheDir = ctx.cacheDir.absolutePath
+                    val userPrefs = UserPrefs.getInstance()
+                    val vo = userPrefs.getVo()
+                    val hwdec = userPrefs.getHwdec()
+                    try {
+                        mpvView.initialize(configDir, cacheDir, vo = vo, hwdec = hwdec)
+                        player.attachView(mpvView)
+                        Log.i("MainPlayerScreen", "MPVView initialized (vo=$vo, hwdec=$hwdec) + attached")
+                    } catch (e: Throwable) {
+                        Log.e("MainPlayerScreen", "MPVView initialize failed", e)
                     }
-                },
-                update = { /* 各 View 的 surfaceChanged 等回调内部已处理 */ },
-                onRelease = { view ->
-                    // AndroidView 从窗口移除时释放播放器原生资源
-                    // MPVView.destroy() 调用 MPVLib.destroy() 销毁 mpv 原生实例
-                    // 不调用会导致 Activity finish 后 mpv 在后台继续播放
-                    Log.i("MainPlayerScreen", "onRelease: destroying player view")
-                    when (view) {
-                        is MPVView -> view.destroy()
+                    viewModel.consumePendingRestore()?.let { (url, time) ->
+                        Log.i("MainPlayerScreen", "Restoring playback: $url @ ${time}s")
+                        player.restorePlaybackState(url, time)
                     }
-                },
+                    mpvView
+                }
+                PlayerType.EXO -> {
+                    val exoView = ExoPlayerView(ctx)
+                    player.attachView(exoView)
+                    viewModel.consumePendingRestore()?.let { (url, time) ->
+                        Log.i("MainPlayerScreen", "Restoring playback (Exo): $url @ ${time}s")
+                        player.restorePlaybackState(url, time)
+                    }
+                    exoView
+                }
+                PlayerType.VLC -> {
+                    val vlcView = VlcVideoView(ctx)
+                    player.attachView(vlcView)
+                    viewModel.consumePendingRestore()?.let { (url, time) ->
+                        Log.i("MainPlayerScreen", "Restoring playback (VLC): $url @ ${time}s")
+                        player.restorePlaybackState(url, time)
+                    }
+                    vlcView
+                }
+                PlayerType.IJK -> {
+                    val ijkView = IjkVideoView(ctx)
+                    player.attachView(ijkView)
+                    viewModel.consumePendingRestore()?.let { (url, time) ->
+                        Log.i("MainPlayerScreen", "Restoring playback (IJK): $url @ ${time}s")
+                        player.restorePlaybackState(url, time)
+                    }
+                    ijkView
+                }
+            }
+        }
+        val onReleasePlayer: (android.view.View) -> Unit = { view ->
+            Log.i("MainPlayerScreen", "onRelease: destroying player view")
+            if (view is MPVView) view.destroy()
+        }
+
+        // 用 movableContentOf 包装主画面 AndroidView，确保 multiViewState.active 变化时
+        // AndroidView 在 Compose 树中移动而不销毁重建（避免 MPV 实例销毁导致播放中断）。
+        // remember(playerType) 确保切换播放器类型时重建 View（不同播放器需要不同 View 类型）。
+        val primaryPlayer = remember(playerType) {
+            movableContentOf {
+                AndroidView(
+                    factory = createPlayerView,
+                    update = { /* 各 View 的 surfaceChanged 等回调内部已处理 */ },
+                    onRelease = onReleasePlayer,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+        }
+
+        if (multiViewState.active) {
+            // 多画面模式：MultiViewOverlay 渲染网格，主画面用 primaryPlayer 填满 cell
+            MultiViewOverlay(
+                state = multiViewState,
+                primaryContent = { primaryPlayer() },
+                getSubPlayer = { idx -> viewModel.getSubPlayerForMultiView(idx) },
+                onViewportClick = { idx -> viewModel.setFocusedViewport(idx) },
+                onViewportClose = { idx -> viewModel.removeFromMultiView(idx) }
+            )
+        } else {
+            // 单画面模式：Box + aspectRatio 控制主画面大小和位置（居中保持比例）
+            Box(
                 modifier = Modifier
                     .align(Alignment.Center)
                     .aspectRatio(aspectRatio)
-            )
+            ) {
+                primaryPlayer()
+            }
         }
 
         // Activity 销毁时 detach 播放器

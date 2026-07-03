@@ -5,6 +5,7 @@ import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -103,6 +104,25 @@ class MainActivityCompose : ComponentActivity() {
                     }
                 }
         }
+
+        // 保持屏幕常亮：视频加载后避免系统进入屏保/休眠（TV 端长时间播放必备）。
+        // 根因：Android TV 系统默认在一段时间无操作后触发屏保（Daydream/Standby），
+        // 视频播放类 APP 必须主动设置 FLAG_KEEP_SCREEN_ON 阻止系统熄屏。
+        // fileLoaded=true（视频已加载，含播放/暂停状态）→ 屏幕常亮
+        // fileLoaded=false（未加载/已停止）→ 清除 FLAG，允许系统正常休眠
+        lifecycleScope.launch {
+            viewModel.mpv.fileLoaded
+                .distinctUntilChanged()
+                .collect { loaded ->
+                    if (loaded) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        Log.i(TAG, "Keep screen on: video loaded")
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        Log.i(TAG, "Allow screen sleep: no video loaded")
+                    }
+                }
+        }
     }
 
     /**
@@ -123,9 +143,14 @@ class MainActivityCompose : ComponentActivity() {
             return super.onKeyDown(keyCode, event)
         }
 
-        // BACK 键：先关闭面板 → 再退出回看/时移 → 最后显示退出确认对话框
+        // BACK 键：先关闭面板 → 再退出多画面 → 再退出回看/时移 → 最后显示退出确认对话框
         if (keyCode == KeyEvent.KEYCODE_BACK) {
             if (viewModel.closeAnyPanel()) {
+                return true
+            }
+            // 多画面激活时，BACK 退出多画面（释放副画面 Player）
+            if (viewModel.multiViewState.value.active) {
+                viewModel.exitMultiView()
                 return true
             }
             // 在回看/时移模式下，BACK 退出回看/时移，恢复直播
@@ -247,6 +272,24 @@ class MainActivityCompose : ComponentActivity() {
         if (viewModel.anyPanelOpen && isDpadNavigation) {
             // 交给 Compose 焦点系统处理（在面板内导航/确认）
             return super.onKeyDown(keyCode, event)
+        }
+
+        // 多画面模式：方向键全部用于切换焦点视口（无面板打开时）。
+        // 多画面激活时方向键不再切频道/seek，避免误切主画面频道；
+        // 用户切主画面频道需通过统一面板的频道列表（点击频道调用 playChannel）。
+        // moveMultiViewFocus 返回 false（如 DUAL 模式上下键）时也拦截，避免触发切频道。
+        if (viewModel.multiViewState.value.active) {
+            val direction = when (keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT -> 0
+                KeyEvent.KEYCODE_DPAD_UP -> 1
+                KeyEvent.KEYCODE_DPAD_RIGHT -> 2
+                KeyEvent.KEYCODE_DPAD_DOWN -> 3
+                else -> -1
+            }
+            if (direction >= 0) {
+                viewModel.moveMultiViewFocus(direction)
+                return true
+            }
         }
 
         when (keyCode) {

@@ -111,6 +111,9 @@ class MediaController:
             # A/V 同步监控入口
             menu.addAction(tr("ctx_av_sync", "A/V Sync Monitor..."), lambda *a: self._show_av_sync_dialog())
 
+            # 流质量检测入口
+            menu.addAction(tr("ctx_stream_quality", "Stream Quality..."), lambda *a: self._show_stream_quality_dialog())
+
             # 3D / 360° 视频入口
             menu.addAction(tr("ctx_3d_video", "3D / 360° Video..."), lambda *a: self._show_3d_dialog())
 
@@ -766,6 +769,18 @@ class MediaController:
             self.window._av_sync_dialog.activateWindow()
         except Exception as e:
             logger.error(f"打开 A/V 同步监控对话框失败: {e}")
+
+    def _show_stream_quality_dialog(self):
+        """打开流质量检测对话框"""
+        try:
+            from ui.dialogs.stream_quality_dialog import StreamQualityDialog
+            if not hasattr(self.window, '_stream_quality_dialog') or not self.window._stream_quality_dialog:
+                self.window._stream_quality_dialog = StreamQualityDialog(self.window)
+            self.window._stream_quality_dialog.show()
+            self.window._stream_quality_dialog.raise_()
+            self.window._stream_quality_dialog.activateWindow()
+        except Exception as e:
+            logger.error(f"打开流质量检测对话框失败: {e}")
 
     def _show_3d_dialog(self):
         """打开 3D / 360° 视频对话框"""

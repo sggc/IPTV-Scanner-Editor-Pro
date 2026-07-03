@@ -371,8 +371,8 @@ fun PlayerSettingsPanel(viewModel: AppViewModel) {
                 val hdrDesc = when (hdrMode) {
                     AppViewModel.HdrMode.DISABLE -> "禁用 HDR：强制 SDR 输出。" +
                         "所有视频按 bt.709/bt.1886 渲染，HDR 视频可能高光过曝"
-                    AppViewModel.HdrMode.AUTO -> "自动模式：Android 端固定走色调映射" +
-                        "（系统 HDR 检测复杂，与 PC 端未启用 HDR 一致）"
+                    AppViewModel.HdrMode.AUTO -> "自动模式：检测设备 HDR 能力，支持则交给系统" +
+                        "自动切换 HDR 显示（直通），不支持则色调映射到 SDR"
                     AppViewModel.HdrMode.TONEMAP -> "HDR→SDR 色调映射：HDR 视频映射到 bt.709/bt.1886。" +
                         "信任 HDR10+ 动态元数据，自动选择算法（HDR10+→st2094-40, HDR10/HLG→bt.2390）"
                     AppViewModel.HdrMode.PASSTHROUGH -> "HDR 直通：HDR 视频按 bt.2020/pq 输出。" +

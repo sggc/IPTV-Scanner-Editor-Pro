@@ -1104,6 +1104,7 @@ class SettingsFileOperations:
         maybe_m3u = path_lower.endswith(('.m3u', '.m3u8', '.txt'))
 
         if maybe_m3u:
+            content = ''
             try:
                 import requests
                 config = w.config
@@ -1125,9 +1126,12 @@ class SettingsFileOperations:
                 logger.error(f"下载M3U列表失败: {e}")
                 if hasattr(w, 'status_bar_show_message'):
                     w.status_bar_show_message(tr("m3u_download_failed", "M3U列表下载失败"))
-                return
+                # 回退到作为单频道串流处理（不 return）
+                # 某些 m3u8 服务器会拒绝 requests 下载（UA/token 校验），
+                # 但 mpv 内部使用自己的 HTTP 客户端可以正常播放，
+                # 因此下载失败时不应阻止直接交给 mpv 播放。
 
-            if content.lstrip().startswith('#EXTM3U'):
+            if content and content.lstrip().startswith('#EXTM3U'):
                 # HLS Playlist 特有标记：#EXT-X-STREAM-INF（主播放列表）或 #EXT-X-TARGETDURATION（媒体播放列表）
                 # 注意：#EXTINF 不能作为 HLS 判断依据，因为普通 M3U 频道列表也包含 #EXTINF
                 is_hls = '#EXT-X-STREAM-INF' in content or '#EXT-X-TARGETDURATION' in content

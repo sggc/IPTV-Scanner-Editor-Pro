@@ -72,7 +72,7 @@ class ClipExportDialog(FloatingDialog):
         self._start_spin.setSingleStep(1.0)
         self._start_spin.setDecimals(2)
         self._start_spin.setSuffix(' s')
-        tform.addRow(tr('clip_export_start', '起始时间'), self._start_spin)
+        tform.addRow(tr('clip_export_start_time', '起始时间'), self._start_spin)
 
         # 时长
         self._duration_spin = QDoubleSpinBox()
@@ -97,10 +97,10 @@ class ClipExportDialog(FloatingDialog):
 
         # 输出格式
         self._format_combo = QComboBox()
-        self._format_combo.addItem('MP4 (视频)', 'mp4')
-        self._format_combo.addItem('MKV (视频)', 'mkv')
-        self._format_combo.addItem('WebM (视频)', 'webm')
-        self._format_combo.addItem('GIF (动画)', 'gif')
+        self._format_combo.addItem(tr('clip_export_format_mp4', 'MP4 (视频)'), 'mp4')
+        self._format_combo.addItem(tr('clip_export_format_mkv', 'MKV (视频)'), 'mkv')
+        self._format_combo.addItem(tr('clip_export_format_webm', 'WebM (视频)'), 'webm')
+        self._format_combo.addItem(tr('clip_export_format_gif', 'GIF (动画)'), 'gif')
         self._format_combo.currentIndexChanged.connect(self._on_format_changed)
         oform.addRow(tr('clip_export_format', '输出格式'), self._format_combo)
 
@@ -145,7 +145,7 @@ class ClipExportDialog(FloatingDialog):
 
         # ===== 操作按钮 =====
         btn_row = QHBoxLayout()
-        self._export_btn = QPushButton(tr('clip_export_start', '开始导出'))
+        self._export_btn = QPushButton(tr('clip_export_start_btn', '开始导出'))
         self._export_btn.clicked.connect(self._on_export_clicked)
         self._cancel_btn = QPushButton(tr('clip_export_cancel', '取消'))
         self._cancel_btn.clicked.connect(self._on_cancel_clicked)
@@ -194,12 +194,13 @@ class ClipExportDialog(FloatingDialog):
 
     def _browse_output(self):
         """选择输出路径"""
+        tr = self.window.language_manager.tr
         fmt = self._format_combo.currentData() or 'mp4'
         ext = 'gif' if fmt == 'gif' else fmt
         filter_str = f"{ext.upper()} (*.{ext});;All Files (*.*)"
         cur_path = self._path_edit.text().strip()
         cur_dir = os.path.dirname(cur_path) if cur_path else os.path.expanduser('~')
-        path, _ = QFileDialog.getSaveFileName(self, '选择输出路径', cur_dir, filter_str)
+        path, _ = QFileDialog.getSaveFileName(self, tr('clip_export_select_output', '选择输出路径'), cur_dir, filter_str)
         if path:
             if not path.lower().endswith(f'.{ext}'):
                 path = path + f'.{ext}'
@@ -207,21 +208,22 @@ class ClipExportDialog(FloatingDialog):
 
     def _on_export_clicked(self):
         """开始导出"""
+        tr = self.window.language_manager.tr
         # 获取源文件
         pc = self.window.player_controller
         if not pc or not pc.is_playing:
-            QMessageBox.warning(self, '提示', '当前无播放内容，无法导出')
+            QMessageBox.warning(self, tr('clip_export_tip', '提示'), tr('clip_export_no_playback', '当前无播放内容，无法导出'))
             return
         source = pc.current_url or ''
         # 处理 file:// 协议
         if source.startswith('file://'):
             source = source[7:]
         if not source or not os.path.exists(source):
-            QMessageBox.warning(self, '提示', f'源文件不存在: {source}')
+            QMessageBox.warning(self, tr('clip_export_tip', '提示'), tr('clip_export_source_not_found', '源文件不存在: {path}').format(path=source))
             return
         output_path = self._path_edit.text().strip()
         if not output_path:
-            QMessageBox.warning(self, '提示', '请选择输出路径')
+            QMessageBox.warning(self, tr('clip_export_tip', '提示'), tr('clip_export_no_output_path', '请选择输出路径'))
             return
         start_sec = float(self._start_spin.value())
         duration = float(self._duration_spin.value())
@@ -231,11 +233,10 @@ class ClipExportDialog(FloatingDialog):
         # 获取服务
         svc = getattr(self.window, 'clip_export_service', None)
         if not svc:
-            QMessageBox.warning(self, '提示', '导出服务未初始化')
+            QMessageBox.warning(self, tr('clip_export_tip', '提示'), tr('clip_export_service_unavailable', '导出服务未初始化'))
             return
         # 切换 UI 状态
         self._set_busy(True)
-        tr = self.window.language_manager.tr
         self._progress.setFormat(tr('clip_export_exporting', '导出中...') if hasattr(self._progress, 'setFormat') else '')
 
         def _on_done(success, message):
@@ -243,9 +244,9 @@ class ClipExportDialog(FloatingDialog):
             def _ui_update():
                 self._set_busy(False)
                 if success:
-                    QMessageBox.information(self, '完成', message)
+                    QMessageBox.information(self, tr('clip_export_done', '完成'), message)
                 else:
-                    QMessageBox.warning(self, '失败', message)
+                    QMessageBox.warning(self, tr('clip_export_failed', '失败'), message)
             QTimer.singleShot(0, _ui_update)
 
         try:
@@ -260,7 +261,7 @@ class ClipExportDialog(FloatingDialog):
                                 done_callback=_on_done)
         except Exception as e:
             self._set_busy(False)
-            QMessageBox.warning(self, '异常', f'导出失败: {e}')
+            QMessageBox.warning(self, tr('clip_export_error', '异常'), tr('clip_export_export_failed', '导出失败: {err}').format(err=e))
 
     def _on_cancel_clicked(self):
         """取消当前导出"""
