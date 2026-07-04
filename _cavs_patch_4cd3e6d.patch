@@ -1,0 +1,22 @@
+From 4cd3e6d87e1cb1b511bb901dfadf4ed4b3f0d188 Mon Sep 17 00:00:00 2001
+From: "PC-20231030HSXX\\Administrator" <1280456922@qq.com>
+Date: Sat, 28 Mar 2026 03:04:02 +0800
+Subject: [PATCH] avcodec/libcavs: init_crop_table() func to static
+
+---
+ libavcodec/libcavs.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libavcodec/libcavs.c b/libavcodec/libcavs.c
+index d1c18ded72523..e22dedaf7241f 100644
+--- a/libavcodec/libcavs.c
++++ b/libavcodec/libcavs.c
+@@ -7587,7 +7587,7 @@ static void pixel_avg_4x4_c(uint8_t* dst, int i_dst, uint8_t* src, int i_src)
+ }
+ #endif
+ 
+-void init_crop_table()
++static void init_crop_table()
+ {
+     int i;
+ 

@@ -1,0 +1,22 @@
+From 0de8ee121be14a148d77fdc45a2f1634f43adf1b Mon Sep 17 00:00:00 2001
+From: "PC-20231030HSXX\\Administrator" <1280456922@qq.com>
+Date: Sun, 15 Mar 2026 10:46:47 +0800
+Subject: [PATCH] avcodec/codec_desc: modify cavs long name
+
+---
+ libavcodec/codec_desc.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libavcodec/codec_desc.c b/libavcodec/codec_desc.c
+index 7a9b3b3765d44..df35bcb7128d3 100644
+--- a/libavcodec/codec_desc.c
++++ b/libavcodec/codec_desc.c
+@@ -658,7 +658,7 @@ static const AVCodecDescriptor codec_descriptors[] = {
+         .id        = AV_CODEC_ID_CAVS,
+         .type      = AVMEDIA_TYPE_VIDEO,
+         .name      = "cavs",
+-        .long_name = NULL_IF_CONFIG_SMALL("Chinese AVS (Audio Video Standard) (AVS1-P2, JiZhun profile)"),
++        .long_name = NULL_IF_CONFIG_SMALL("Chinese AVS (Audio Video Standard) (AVS1-P2, JiZhun profile) and (AVS1-P16, Guangdian profile)"),
+         .props     = AV_CODEC_PROP_LOSSY | AV_CODEC_PROP_REORDER,
+     },
+     {
