@@ -56,14 +56,31 @@ jobs:
           ls -la build/patches/
 
       - name: Build libdavs2 (AVS2 decoder)
-        # 构建 AVS2 外部解码器库 (pkuvcl/davs2)
+        # 构建 AVS2 外部解码器库 (pkuvcl/davs2 1.7)
+        # 修复 3 个问题：
+        # 1. config.guess (2017) 不识别 macOS ARM64 → 更新到最新版本
+        # 2. ARM64 上 aarch64 汇编源文件缺失 → --disable-asm
+        # 3. davs2 安装 davs2.pc，FFmpeg 查找 libdavs2.pc → 创建符号链接
         run: |
           cd build/davs2
           git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git .
           cd build/linux
-          ./configure --prefix="$HOME/davs2-install" --enable-shared --disable-static
+          # 更新 config.guess/config.sub 到最新版本（davs2 1.7 自带的是 2017 版本，不识别 macOS ARM64）
+          curl -fsSL https://git.savannah.gnu.org/cgit/config.git/plain/config.guess -o config.guess
+          curl -fsSL https://git.savannah.gnu.org/cgit/config.git/plain/config.sub -o config.sub
+          chmod +x config.guess config.sub
+          ./configure \
+            --prefix="$HOME/davs2-install" \
+            --enable-shared \
+            --disable-static \
+            --disable-asm \
+            --enable-pic
           make -j$(sysctl -n hw.ncpu)
           make install
+          # 修复 pkg-config 文件名：davs2.pc → libdavs2.pc
+          # FFmpeg 的 --enable-libdavs2 查找 libdavs2.pc，但 davs2 安装的是 davs2.pc
+          cd "$HOME/davs2-install/lib/pkgconfig"
+          [ -f davs2.pc ] && [ ! -f libdavs2.pc ] && ln -sf davs2.pc libdavs2.pc
           # 验证 pkg-config 元数据
           export PKG_CONFIG_PATH="$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
           pkg-config --modversion libdavs2
@@ -232,14 +249,30 @@ jobs:
           ls -la build/patches/
 
       - name: Build libdavs2 (AVS2 decoder)
+        # 修复 3 个问题：
+        # 1. config.guess (2017) 不识别 macOS ARM64 → 更新到最新版本
+        # 2. ARM64 上 aarch64 汇编源文件缺失 → --disable-asm
+        # 3. davs2 安装 davs2.pc，FFmpeg 查找 libdavs2.pc → 创建符号链接
         run: |
           cd build/davs2
           git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git .
           cd build/linux
-          ./configure --prefix="$HOME/davs2-install" --enable-shared --disable-static
+          # 更新 config.guess/config.sub 到最新版本（davs2 1.7 自带的是 2017 版本，不识别 macOS ARM64）
+          curl -fsSL https://git.savannah.gnu.org/cgit/config.git/plain/config.guess -o config.guess
+          curl -fsSL https://git.savannah.gnu.org/cgit/config.git/plain/config.sub -o config.sub
+          chmod +x config.guess config.sub
+          ./configure \
+            --prefix="$HOME/davs2-install" \
+            --enable-shared \
+            --disable-static \
+            --disable-asm \
+            --enable-pic
           make -j$(nproc)
           make install
           sudo ldconfig
+          # 修复 pkg-config 文件名：davs2.pc → libdavs2.pc
+          cd "$HOME/davs2-install/lib/pkgconfig"
+          [ -f davs2.pc ] && [ ! -f libdavs2.pc ] && ln -sf davs2.pc libdavs2.pc
           export PKG_CONFIG_PATH="$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
           pkg-config --modversion libdavs2
           echo "PKG_CONFIG_PATH=$HOME/davs2-install/lib/pkgconfig" >> "$GITHUB_ENV"
@@ -391,14 +424,30 @@ jobs:
           ls -la build/patches/
 
       - name: Build libdavs2 (AVS2 decoder)
+        # 修复 3 个问题：
+        # 1. config.guess (2017) 不识别 macOS ARM64 → 更新到最新版本
+        # 2. ARM64 上 aarch64 汇编源文件缺失 → --disable-asm
+        # 3. davs2 安装 davs2.pc，FFmpeg 查找 libdavs2.pc → 创建符号链接
         run: |
           cd build/davs2
           git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git .
           cd build/linux
-          ./configure --prefix="$HOME/davs2-install" --enable-shared --disable-static
+          # 更新 config.guess/config.sub 到最新版本（davs2 1.7 自带的是 2017 版本，不识别 macOS ARM64）
+          curl -fsSL https://git.savannah.gnu.org/cgit/config.git/plain/config.guess -o config.guess
+          curl -fsSL https://git.savannah.gnu.org/cgit/config.git/plain/config.sub -o config.sub
+          chmod +x config.guess config.sub
+          ./configure \
+            --prefix="$HOME/davs2-install" \
+            --enable-shared \
+            --disable-static \
+            --disable-asm \
+            --enable-pic
           make -j$(nproc)
           make install
           sudo ldconfig
+          # 修复 pkg-config 文件名：davs2.pc → libdavs2.pc
+          cd "$HOME/davs2-install/lib/pkgconfig"
+          [ -f davs2.pc ] && [ ! -f libdavs2.pc ] && ln -sf davs2.pc libdavs2.pc
           export PKG_CONFIG_PATH="$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
           pkg-config --modversion libdavs2
           echo "PKG_CONFIG_PATH=$HOME/davs2-install/lib/pkgconfig" >> "$GITHUB_ENV"
