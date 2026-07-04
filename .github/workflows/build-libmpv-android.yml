@@ -1,0 +1,266 @@
+name: Build libmpv with CAVS support (Android)
+
+# 构建 Android 版 libmpv（带 CAVS Guangdian profile 支持）
+# 使用 mpv-android 官方 buildscripts + llawsxx/FFmpeg 的 6 个 CAVS patch
+# 产物上传到 GitHub Release，供 build.yml 下载使用
+#
+# CAVS (AVS1-P16, 广电 profile) 通过 patch 修改内置 cavs 解码器实现
+# 注意：mpv-android 默认不启用 libdavs2，因此 Android 端无 AVS2 外部解码器
+#       但 CAVS 解码器是内置实现，不依赖外部库
+#
+# 构建方式：
+# 1. 克隆 mpv-android 仓库
+# 2. 修改 buildscripts/include/download-deps.sh，在 FFmpeg clone 后应用 CAVS patch
+# 3. 运行 buildscripts/buildall.sh 构建各 ABI 的 libmpv
+# 4. 提取 libmpv.so 文件打包
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to upload libmpv to (e.g. libmpv-cavs-latest)"
+        required: true
+        default: "libmpv-cavs-latest"
+
+permissions:
+  contents: write
+
+env:
+  # mpv-android 仓库版本（使用最新 release tag）
+  MPV_ANDROID_REF: "2026-04-25"
+
+jobs:
+  build:
+    name: Build libmpv for Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 4 种 ABI 分别构建（并行）
+        arch:
+          - { name: arm64-v8a, buildall_arg: arm64 }
+          - { name: armeabi-v7a, buildall_arg: armv7l }
+          - { name: x86_64, buildall_arg: x86_64 }
+          - { name: x86, buildall_arg: x86 }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        # mpv-android buildscripts 在 Linux 上运行需要的依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential meson ninja-build pkg-config \
+            nasm yasm python3-pip git autoconf automake libtool \
+            cmake ccache unzip wget curl \
+            libssl-dev zlib1g-dev
+          pip3 install meson mako jsonschema
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        # mpv-android buildscripts 需要 NDK r29
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "ndk;29.0.14206865" "platform-tools"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          ls -la "$ANDROID_HOME/ndk/"
+
+      - name: Clone mpv-android
+        run: |
+          git clone --depth 1 --branch ${{ env.MPV_ANDROID_REF }} \
+            https://github.com/mpv-android/mpv-android.git
+          cd mpv-android
+          git submodule update --init --recursive || true
+          echo "=== buildscripts structure ==="
+          ls -la buildscripts/
+          ls -la buildscripts/scripts/ 2>/dev/null || true
+          ls -la buildscripts/include/ 2>/dev/null || true
+
+      - name: Download CAVS patches
+        # 下载 llawsxx/FFmpeg 的 6 个 CAVS 相关 commits 作为 patch
+        run: |
+          mkdir -p cavs_patches
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          for sha in $CAVS_PATCHES; do
+            echo "Downloading CAVS patch $sha..."
+            curl -fsSL "https://github.com/llawsxx/FFmpeg/commit/${sha}.patch" \
+              -o "cavs_patches/${sha}.patch" || { echo "Failed to download patch $sha"; exit 1; }
+          done
+          ls -la cavs_patches/
+
+      - name: Download dependencies
+        # 运行 download.sh 下载所有依赖（包括 FFmpeg 源码）
+        run: |
+          cd mpv-android/buildscripts
+          # 设置 IN_CI=1 使用稳定的 release 版本（n8.1.2）
+          export IN_CI=1
+          ./download.sh
+          echo "=== FFmpeg source location ==="
+          find . -type d -name "ffmpeg" | grep -v ".git" | head -5
+          ls -la deps/ 2>/dev/null || ls -la sources/ 2>/dev/null || true
+
+      - name: Apply CAVS patches to FFmpeg
+        # 在 download.sh 下载 FFmpeg 后，手动应用 CAVS patch
+        run: |
+          cd mpv-android/buildscripts
+          # 查找 FFmpeg 源码目录（可能在 deps/ffmpeg 或 sources/ffmpeg）
+          FFMPEG_DIR=""
+          for candidate in deps/ffmpeg sources/ffmpeg; do
+            if [ -d "$candidate/libavcodec" ]; then
+              FFMPEG_DIR="$candidate"
+              break
+            fi
+          done
+          if [ -z "$FFMPEG_DIR" ]; then
+            FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+            if [ ! -d "$FFMPEG_DIR/libavcodec" ]; then
+              echo "ERROR: FFmpeg source directory with libavcodec not found"
+              find . -type d -name "*ffmpeg*" | head -10
+              exit 1
+            fi
+          fi
+          echo "Found FFmpeg source: $FFMPEG_DIR"
+          cd "$FFMPEG_DIR"
+
+          # 应用 CAVS patch：使用 --batch --forward 容忍失败的 hunk
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          # 计算 patches 目录的绝对路径
+          PATCHES_DIR="$(cd "$(dirname "$0")/../../cavs_patches" 2>/dev/null && pwd || echo "$GITHUB_WORKSPACE/cavs_patches")"
+          echo "Using patches from: $PATCHES_DIR"
+          for sha in $CAVS_PATCHES; do
+            echo "=== Applying CAVS patch $sha ==="
+            patch -p1 --batch --forward -i "$PATCHES_DIR/${sha}.patch" || true
+          done
+
+          # 手动修复 codec_id.h：在 AV_CODEC_ID_AHX 后添加 AV_CODEC_ID_DRA
+          grep -q AV_CODEC_ID_DRA libavcodec/codec_id.h || \
+            sed -i '/AV_CODEC_ID_AHX,/a\    AV_CODEC_ID_DRA,' libavcodec/codec_id.h
+
+          # 验证 patch 应用结果
+          echo "=== Verify CAVS files exist ==="
+          ls -la libavcodec/libcavs* libavcodec/libcavsdec* libavcodec/dradec* 2>/dev/null || \
+            { echo "ERROR: CAVS patch did not apply correctly"; exit 1; }
+
+      - name: Build libmpv for ${{ matrix.arch.name }}
+        # 为当前 ABI 构建 libmpv
+        run: |
+          cd mpv-android/buildscripts
+          export IN_CI=1
+          # 只构建 libmpv，不构建 APK
+          ./buildall.sh --arch ${{ matrix.arch.buildall_arg }} mpv
+          echo "=== Build artifacts ==="
+          find . -name "libmpv.so" -ls 2>/dev/null || true
+          find . -name "*.so" -path "*/mpv/*" -ls 2>/dev/null || true
+
+      - name: Locate and collect libmpv.so
+        # 查找并收集构建产物
+        run: |
+          cd mpv-android/buildscripts
+          # mpv-android buildscripts 的产物通常在 build/<arch>/mpv/install_dir/lib/ 下
+          ARTIFACT_DIR="artifacts/${{ matrix.arch.name }}"
+          mkdir -p "$ARTIFACT_DIR"
+
+          # 查找 libmpv.so
+          MPV_SO=$(find . -name "libmpv.so" -type f | head -1)
+          if [ -z "$MPV_SO" ]; then
+              echo "ERROR: libmpv.so not found for ${{ matrix.arch.name }}"
+              echo "=== Searching for any .so files ==="
+              find . -name "*.so" -ls | head -30
+              exit 1
+          fi
+
+          echo "Found libmpv.so: $MPV_SO"
+          cp -L "$MPV_SO" "$ARTIFACT_DIR/"
+
+          # 同时收集 FFmpeg 相关的 .so 文件（如果有）
+          find . -name "libavcodec.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+          find . -name "libavformat.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+          find . -name "libavutil.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+          find . -name "libswscale.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+          find . -name "libswresample.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+          find . -name "libdav1d.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+
+          echo "=== Collected artifacts ==="
+          ls -la "$ARTIFACT_DIR/"
+
+          # 验证 CAVS 支持
+          echo "=== Checking cavs strings in libmpv.so ==="
+          strings "$ARTIFACT_DIR/libmpv.so" | grep -iE "guangdian|jizhun|cavs" | head -10 || \
+            echo "WARNING: Could not find CAVS strings in libmpv.so"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-cavs-android-${{ matrix.arch.name }}
+          path: mpv-android/buildscripts/artifacts/${{ matrix.arch.name }}/
+          retention-days: 7
+
+  release:
+    name: Package and upload to release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libmpv-cavs-android-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Package all ABIs
+        # 将 4 个 ABI 的 .so 文件打包成一个 tar.gz
+        run: |
+          mkdir -p release/jniLibs
+          for arch in arm64-v8a armeabi-v7a x86_64 x86; do
+            echo "=== Processing $arch ==="
+            ARTIFACT_DIR="artifacts/libmpv-cavs-android-$arch"
+            if [ -d "$ARTIFACT_DIR" ]; then
+              mkdir -p "release/jniLibs/$arch"
+              cp "$ARTIFACT_DIR"/*.so "release/jniLibs/$arch/" 2>/dev/null || true
+              echo "Files in $arch:"
+              ls -la "release/jniLibs/$arch/"
+            else
+              echo "WARNING: $arch artifact not found"
+            fi
+          done
+
+          # 验证所有 ABI 都有 libmpv.so
+          echo "=== Verifying all ABIs ==="
+          for arch in arm64-v8a armeabi-v7a x86_64 x86; do
+            if [ ! -f "release/jniLibs/$arch/libmpv.so" ]; then
+              echo "ERROR: libmpv.so missing for $arch"
+              exit 1
+            fi
+          done
+
+          # 打包
+          cd release
+          tar czf libmpv-cavs-android.tar.gz jniLibs
+          ls -la libmpv-cavs-android.tar.gz
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: release/libmpv-cavs-android.tar.gz
+          fail_on_unmatched_files: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

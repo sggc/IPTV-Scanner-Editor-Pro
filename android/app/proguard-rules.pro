@@ -12,6 +12,11 @@
     native <methods>;
 }
 
+# MPVLib 回调方法（libplayer.so 通过 JNI 反射调用 eventProperty/event/logMessage 等
+# 非原生方法，R8 静态分析看不到 Java/Kotlin 端引用，必须显式保留，否则启动即闪退）
+-keep class is.xyz.mpv.MPVLib { *; }
+-keep class is.xyz.mpv.MPVLib$* { *; }
+
 # VLC Java 绑定（org.videolan.libvlc 反射加载）
 -keep class org.videolan.libvlc.** { *; }
 -keep class org.videolan.medialibrary.** { *; }

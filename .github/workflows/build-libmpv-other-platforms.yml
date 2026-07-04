@@ -1,0 +1,504 @@
+name: Build libmpv with CAVS support (macOS/Linux)
+
+# 构建 macOS 和 Linux 版 libmpv（带 CAVS Guangdian profile + AVS2/libdavs2 支持）
+# 使用官方 FFmpeg + llawsxx/FFmpeg 的 6 个 CAVS patch + pkuvcl/davs2 (libdavs2)
+# 产物上传到 GitHub Release，供 build.yml 下载使用
+#
+# CAVS (AVS1-P16, 广电 profile) 通过 patch 修改内置 cavs 解码器实现
+# AVS2 (4K) 通过 libdavs2 外部库实现（--enable-libdavs2）
+# 两者并存，不丢失任何其他解码器
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to upload libmpv to (e.g. libmpv-cavs-latest)"
+        required: true
+        default: "libmpv-cavs-latest"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-arm64:
+    name: Build libmpv for macOS ARM64
+    runs-on: macos-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install meson ninja pkg-config nasm yasm \
+            libass libplacebo luajit jpeg-turbo zlib \
+            molten-vk vulkan-loader autoconf automake libtool
+          # 安装 meson/ninja 已通过 brew 完成，确认版本
+          meson --version
+          ninja --version
+
+      - name: Setup build directories
+        run: |
+          mkdir -p build/{ffmpeg,mpv,davs2,patches}
+          mkdir -p release
+
+      - name: Download CAVS patches
+        # 下载 llawsxx/FFmpeg 的 6 个 CAVS 相关 commits 作为 patch
+        run: |
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          for sha in $CAVS_PATCHES; do
+            echo "Downloading CAVS patch $sha..."
+            curl -fsSL "https://github.com/llawsxx/FFmpeg/commit/${sha}.patch" \
+              -o "build/patches/${sha}.patch" || { echo "Failed to download patch $sha"; exit 1; }
+          done
+          ls -la build/patches/
+
+      - name: Build libdavs2 (AVS2 decoder)
+        # 构建 AVS2 外部解码器库 (pkuvcl/davs2)
+        run: |
+          cd build/davs2
+          git clone --depth 1 --branch v1.8.1 https://github.com/pkuvcl/davs2.git .
+          cd build/linux
+          ./configure --prefix="$HOME/davs2-install" --enable-shared --disable-static
+          make -j$(sysctl -n hw.ncpu)
+          make install
+          # 验证 pkg-config 元数据
+          export PKG_CONFIG_PATH="$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          pkg-config --modversion libdavs2
+          echo "PKG_CONFIG_PATH=$HOME/davs2-install/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Download and patch FFmpeg
+        # 下载官方 FFmpeg master，应用 6 个 CAVS patch
+        run: |
+          cd build/ffmpeg
+          git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git .
+          # 应用 CAVS patch：使用 --batch --forward 容忍失败的 hunk
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          for sha in $CAVS_PATCHES; do
+            echo "=== Applying CAVS patch $sha ==="
+            patch -p1 --batch --forward -i ../patches/${sha}.patch || true
+          done
+          # 手动修复 codec_id.h：在 AV_CODEC_ID_AHX 后添加 AV_CODEC_ID_DRA
+          # d208cf8 patch 中这个 hunk 因官方 FFmpeg 行号变化而失败
+          # 使用 perl 替代 sed，确保 macOS(BSD) 和 Linux(GNU) 兼容
+          grep -q AV_CODEC_ID_DRA libavcodec/codec_id.h || \
+            perl -i -pe 's/(AV_CODEC_ID_AHX,)/$1\n    AV_CODEC_ID_DRA,/' libavcodec/codec_id.h
+          # 验证 patch 应用结果
+          echo "=== Verify CAVS files exist ==="
+          ls -la libavcodec/libcavs* libavcodec/libcavsdec* libavcodec/dradec* 2>/dev/null || \
+            { echo "ERROR: CAVS patch did not apply correctly"; exit 1; }
+
+      - name: Build FFmpeg
+        # 构建 FFmpeg（启用 libdavs2 for AVS2，CAVS patch 已应用）
+        run: |
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export PKG_CONFIG_PATH="$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          cd build/ffmpeg
+          ./configure \
+            --prefix="$HOME/ffmpeg-cavs" \
+            --enable-shared \
+            --disable-static \
+            --enable-gpl \
+            --enable-libdavs2 \
+            --disable-doc \
+            --disable-ffplay \
+            --disable-programs \
+            --enable-network \
+            --extra-cflags="-I$HOME/davs2-install/include" \
+            --extra-ldflags="-L$HOME/davs2-install/lib -Wl,-rpath,$HOME/davs2-install/lib"
+          make -j$(sysctl -n hw.ncpu)
+          make install
+          # 验证 FFmpeg 配置
+          echo "=== FFmpeg decoders (cavs/avs2) ==="
+          "$HOME/ffmpeg-cavs/bin/ffmpeg" -decoders 2>/dev/null | grep -E "cavs|avs2" || true
+          echo "PKG_CONFIG_PATH=$HOME/ffmpeg-cavs/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
+      - name: Build mpv
+        # 构建 libmpv，链接自定义 FFmpeg
+        run: |
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export PKG_CONFIG_PATH="$HOME/ffmpeg-cavs/lib/pkgconfig:$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          cd build/mpv
+          git clone --depth 1 https://github.com/mpv-player/mpv.git .
+          meson setup build_dir \
+            --prefix="$HOME/mpv-install" \
+            --buildtype=release \
+            -Dlibmpv=true \
+            -Dcplayer=false \
+            -Dgpl=true \
+            -Dlibavdevice=enabled
+          meson compile -C build_dir
+          meson install -C build_dir
+          # 验证产物
+          echo "=== libmpv install tree ==="
+          find "$HOME/mpv-install" -name "libmpv*" -ls
+
+      - name: Package libmpv
+        # 打包 libmpv 及其依赖（libdavs2, FFmpeg libs）
+        run: |
+          STAGING="release/libmpv-cavs-macos-arm64"
+          mkdir -p "$STAGING/lib"
+          # 复制 libmpv
+          cp -L "$HOME/mpv-install/lib/libmpv.2.dylib" "$STAGING/lib/" 2>/dev/null || \
+            cp -L "$HOME/mpv-install/lib/"libmpv.*.dylib "$STAGING/lib/"
+          # 复制 FFmpeg 动态库
+          cp -L "$HOME/ffmpeg-cavs/lib/"libav*.dylib "$STAGING/lib/" 2>/dev/null || true
+          cp -L "$HOME/ffmpeg-cavs/lib/"libsw*.dylib "$STAGING/lib/" 2>/dev/null || true
+          # 复制 libdavs2
+          cp -L "$HOME/davs2-install/lib/"libdavs2*.dylib "$STAGING/lib/" 2>/dev/null || true
+          # 修复 dylib 链接路径（使用 @rpath）
+          cd "$STAGING/lib"
+          for f in *.dylib; do
+            install_name_tool -id "@rpath/$f" "$f" 2>/dev/null || true
+            # 将对同级库的引用改为 @rpath
+            for dep in *.dylib; do
+              [ "$f" = "$dep" ] && continue
+              install_name_tool -change "$HOME/ffmpeg-cavs/lib/$dep" "@rpath/$dep" "$f" 2>/dev/null || true
+              install_name_tool -change "$HOME/davs2-install/lib/$dep" "@rpath/$dep" "$f" 2>/dev/null || true
+              install_name_tool -change "$HOME/mpv-install/lib/$dep" "@rpath/$dep" "$f" 2>/dev/null || true
+            done
+          done
+          # 复制头文件（供 Python ctypes 绑定使用）
+          mkdir -p "$STAGING/include/mpv"
+          cp -r "$HOME/mpv-install/include/mpv/"* "$STAGING/include/mpv/"
+          # 打包
+          cd release
+          tar czf libmpv-cavs-macos-arm64.tar.gz libmpv-cavs-macos-arm64
+          ls -la libmpv-cavs-macos-arm64.tar.gz
+
+      - name: Verify CAVS support
+        run: |
+          echo "=== Checking cavs/avs2 strings in libmpv ==="
+          STAGING="release/libmpv-cavs-macos-arm64/lib"
+          find "$STAGING" -name "libmpv*" -exec sh -c 'echo "--- {} ---"; strings "{}" | grep -iE "guangdian|jizhun|cavs|avs2|libdavs2" | head -20' \;
+          echo "=== otool output (libmpv dependencies) ==="
+          otool -L "$STAGING"/libmpv.*.dylib 2>/dev/null | head -30
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-cavs-macos-arm64
+          path: release/libmpv-cavs-macos-arm64.tar.gz
+          retention-days: 1
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: release/libmpv-cavs-macos-arm64.tar.gz
+          fail_on_unmatched_files: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-linux-x86_64:
+    name: Build libmpv for Linux x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential meson ninja-build pkg-config \
+            nasm yasm python3-pip git autoconf automake libtool \
+            libass-dev zlib1g-dev libjpeg-dev libplacebo-dev \
+            libgl-dev libx11-dev libxrandr-dev libxext-dev \
+            libxss-dev libxpresent-dev libvdpau-dev libva-dev \
+            libx264-dev libx265-dev libvpx-dev libmp3lame-dev libopus-dev \
+            liblua5.1-0-dev libjpeg-dev
+          meson --version
+          ninja --version
+
+      - name: Setup build directories
+        run: |
+          mkdir -p build/{ffmpeg,mpv,davs2,patches}
+          mkdir -p release
+
+      - name: Download CAVS patches
+        run: |
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          for sha in $CAVS_PATCHES; do
+            echo "Downloading CAVS patch $sha..."
+            curl -fsSL "https://github.com/llawsxx/FFmpeg/commit/${sha}.patch" \
+              -o "build/patches/${sha}.patch" || { echo "Failed to download patch $sha"; exit 1; }
+          done
+          ls -la build/patches/
+
+      - name: Build libdavs2 (AVS2 decoder)
+        run: |
+          cd build/davs2
+          git clone --depth 1 --branch v1.8.1 https://github.com/pkuvcl/davs2.git .
+          cd build/linux
+          ./configure --prefix="$HOME/davs2-install" --enable-shared --disable-static
+          make -j$(nproc)
+          make install
+          sudo ldconfig
+          export PKG_CONFIG_PATH="$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          pkg-config --modversion libdavs2
+          echo "PKG_CONFIG_PATH=$HOME/davs2-install/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Download and patch FFmpeg
+        run: |
+          cd build/ffmpeg
+          git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git .
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          for sha in $CAVS_PATCHES; do
+            echo "=== Applying CAVS patch $sha ==="
+            patch -p1 --batch --forward -i ../patches/${sha}.patch || true
+          done
+          # 手动修复 codec_id.h
+          grep -q AV_CODEC_ID_DRA libavcodec/codec_id.h || \
+            sed -i '/AV_CODEC_ID_AHX,/a\    AV_CODEC_ID_DRA,' libavcodec/codec_id.h
+          echo "=== Verify CAVS files exist ==="
+          ls -la libavcodec/libcavs* libavcodec/libcavsdec* libavcodec/dradec* 2>/dev/null || \
+            { echo "ERROR: CAVS patch did not apply correctly"; exit 1; }
+
+      - name: Build FFmpeg
+        run: |
+          export PKG_CONFIG_PATH="$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          cd build/ffmpeg
+          ./configure \
+            --prefix="$HOME/ffmpeg-cavs" \
+            --enable-shared \
+            --disable-static \
+            --enable-gpl \
+            --enable-libdavs2 \
+            --disable-doc \
+            --disable-ffplay \
+            --disable-programs \
+            --enable-network \
+            --extra-cflags="-I$HOME/davs2-install/include -fPIC" \
+            --extra-ldflags="-L$HOME/davs2-install/lib -Wl,-rpath,$HOME/davs2-install/lib"
+          make -j$(nproc)
+          make install
+          sudo ldconfig
+          echo "=== FFmpeg decoders (cavs/avs2) ==="
+          "$HOME/ffmpeg-cavs/bin/ffmpeg" -decoders 2>/dev/null | grep -E "cavs|avs2" || true
+          echo "PKG_CONFIG_PATH=$HOME/ffmpeg-cavs/lib/pkgconfig:$HOME/davs2-install/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build mpv
+        run: |
+          export PKG_CONFIG_PATH="$HOME/ffmpeg-cavs/lib/pkgconfig:$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          cd build/mpv
+          git clone --depth 1 https://github.com/mpv-player/mpv.git .
+          meson setup build_dir \
+            --prefix="$HOME/mpv-install" \
+            --buildtype=release \
+            -Dlibmpv=true \
+            -Dcplayer=false \
+            -Dgpl=true \
+            -Dlibavdevice=enabled
+          meson compile -C build_dir
+          meson install -C build_dir
+          echo "=== libmpv install tree ==="
+          find "$HOME/mpv-install" -name "libmpv*" -ls
+
+      - name: Package libmpv
+        # 打包 libmpv 及其依赖
+        run: |
+          STAGING="release/libmpv-cavs-linux-x86_64"
+          mkdir -p "$STAGING/lib"
+          # 复制 libmpv
+          cp -L "$HOME/mpv-install/lib/libmpv.so.2" "$STAGING/lib/" 2>/dev/null || \
+            cp -L "$HOME/mpv-install/lib/"libmpv.so* "$STAGING/lib/"
+          # 复制 FFmpeg 动态库
+          cp -L "$HOME/ffmpeg-cavs/lib/"libav*.so* "$STAGING/lib/" 2>/dev/null || true
+          cp -L "$HOME/ffmpeg-cavs/lib/"libsw*.so* "$STAGING/lib/" 2>/dev/null || true
+          # 复制 libdavs2
+          cp -L "$HOME/davs2-install/lib/"libdavs2.so* "$STAGING/lib/" 2>/dev/null || true
+          # 复制头文件
+          mkdir -p "$STAGING/include/mpv"
+          cp -r "$HOME/mpv-install/include/mpv/"* "$STAGING/include/mpv/"
+          # 修复 soname 链接（创建符号链接）
+          cd "$STAGING/lib"
+          # 确保有 libmpv.so.2 符号链接
+          if [ ! -L libmpv.so.2 ] && [ -f libmpv.so.2.* ]; then
+            ln -sf libmpv.so.2.* libmpv.so.2
+          fi
+          # 打包
+          cd release
+          tar czf libmpv-cavs-linux-x86_64.tar.gz libmpv-cavs-linux-x86_64
+          ls -la libmpv-cavs-linux-x86_64.tar.gz
+
+      - name: Verify CAVS support
+        run: |
+          echo "=== Checking cavs/avs2 strings in libmpv ==="
+          STAGING="release/libmpv-cavs-linux-x86_64/lib"
+          find "$STAGING" -name "libmpv*" -exec sh -c 'echo "--- {} ---"; strings "{}" | grep -iE "guangdian|jizhun|cavs|avs2|libdavs2" | head -20' \;
+          echo "=== ldd output (libmpv dependencies) ==="
+          ldd "$STAGING"/libmpv.so.2 2>/dev/null | head -30
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-cavs-linux-x86_64
+          path: release/libmpv-cavs-linux-x86_64.tar.gz
+          retention-days: 1
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: release/libmpv-cavs-linux-x86_64.tar.gz
+          fail_on_unmatched_files: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-linux-arm64:
+    name: Build libmpv for Linux ARM64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential meson ninja-build pkg-config \
+            nasm yasm python3-pip git autoconf automake libtool \
+            libass-dev zlib1g-dev libjpeg-dev libplacebo-dev \
+            libgl-dev libx11-dev libxrandr-dev libxext-dev \
+            libxss-dev libxpresent-dev libvdpau-dev libva-dev \
+            libx264-dev libx265-dev libvpx-dev libmp3lame-dev libopus-dev \
+            liblua5.1-0-dev libjpeg-dev
+          meson --version
+          ninja --version
+
+      - name: Setup build directories
+        run: |
+          mkdir -p build/{ffmpeg,mpv,davs2,patches}
+          mkdir -p release
+
+      - name: Download CAVS patches
+        run: |
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          for sha in $CAVS_PATCHES; do
+            echo "Downloading CAVS patch $sha..."
+            curl -fsSL "https://github.com/llawsxx/FFmpeg/commit/${sha}.patch" \
+              -o "build/patches/${sha}.patch" || { echo "Failed to download patch $sha"; exit 1; }
+          done
+          ls -la build/patches/
+
+      - name: Build libdavs2 (AVS2 decoder)
+        run: |
+          cd build/davs2
+          git clone --depth 1 --branch v1.8.1 https://github.com/pkuvcl/davs2.git .
+          cd build/linux
+          ./configure --prefix="$HOME/davs2-install" --enable-shared --disable-static
+          make -j$(nproc)
+          make install
+          sudo ldconfig
+          export PKG_CONFIG_PATH="$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          pkg-config --modversion libdavs2
+          echo "PKG_CONFIG_PATH=$HOME/davs2-install/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Download and patch FFmpeg
+        run: |
+          cd build/ffmpeg
+          git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git .
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          for sha in $CAVS_PATCHES; do
+            echo "=== Applying CAVS patch $sha ==="
+            patch -p1 --batch --forward -i ../patches/${sha}.patch || true
+          done
+          grep -q AV_CODEC_ID_DRA libavcodec/codec_id.h || \
+            sed -i '/AV_CODEC_ID_AHX,/a\    AV_CODEC_ID_DRA,' libavcodec/codec_id.h
+          echo "=== Verify CAVS files exist ==="
+          ls -la libavcodec/libcavs* libavcodec/libcavsdec* libavcodec/dradec* 2>/dev/null || \
+            { echo "ERROR: CAVS patch did not apply correctly"; exit 1; }
+
+      - name: Build FFmpeg
+        run: |
+          export PKG_CONFIG_PATH="$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          cd build/ffmpeg
+          ./configure \
+            --prefix="$HOME/ffmpeg-cavs" \
+            --enable-shared \
+            --disable-static \
+            --enable-gpl \
+            --enable-libdavs2 \
+            --disable-doc \
+            --disable-ffplay \
+            --disable-programs \
+            --enable-network \
+            --extra-cflags="-I$HOME/davs2-install/include -fPIC" \
+            --extra-ldflags="-L$HOME/davs2-install/lib -Wl,-rpath,$HOME/davs2-install/lib"
+          make -j$(nproc)
+          make install
+          sudo ldconfig
+          echo "=== FFmpeg decoders (cavs/avs2) ==="
+          "$HOME/ffmpeg-cavs/bin/ffmpeg" -decoders 2>/dev/null | grep -E "cavs|avs2" || true
+          echo "PKG_CONFIG_PATH=$HOME/ffmpeg-cavs/lib/pkgconfig:$HOME/davs2-install/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build mpv
+        run: |
+          export PKG_CONFIG_PATH="$HOME/ffmpeg-cavs/lib/pkgconfig:$HOME/davs2-install/lib/pkgconfig:$PKG_CONFIG_PATH"
+          cd build/mpv
+          git clone --depth 1 https://github.com/mpv-player/mpv.git .
+          meson setup build_dir \
+            --prefix="$HOME/mpv-install" \
+            --buildtype=release \
+            -Dlibmpv=true \
+            -Dcplayer=false \
+            -Dgpl=true \
+            -Dlibavdevice=enabled
+          meson compile -C build_dir
+          meson install -C build_dir
+          echo "=== libmpv install tree ==="
+          find "$HOME/mpv-install" -name "libmpv*" -ls
+
+      - name: Package libmpv
+        run: |
+          STAGING="release/libmpv-cavs-linux-arm64"
+          mkdir -p "$STAGING/lib"
+          cp -L "$HOME/mpv-install/lib/libmpv.so.2" "$STAGING/lib/" 2>/dev/null || \
+            cp -L "$HOME/mpv-install/lib/"libmpv.so* "$STAGING/lib/"
+          cp -L "$HOME/ffmpeg-cavs/lib/"libav*.so* "$STAGING/lib/" 2>/dev/null || true
+          cp -L "$HOME/ffmpeg-cavs/lib/"libsw*.so* "$STAGING/lib/" 2>/dev/null || true
+          cp -L "$HOME/davs2-install/lib/"libdavs2.so* "$STAGING/lib/" 2>/dev/null || true
+          mkdir -p "$STAGING/include/mpv"
+          cp -r "$HOME/mpv-install/include/mpv/"* "$STAGING/include/mpv/"
+          cd "$STAGING/lib"
+          if [ ! -L libmpv.so.2 ] && [ -f libmpv.so.2.* ]; then
+            ln -sf libmpv.so.2.* libmpv.so.2
+          fi
+          cd ../../..
+          cd release
+          tar czf libmpv-cavs-linux-arm64.tar.gz libmpv-cavs-linux-arm64
+          ls -la libmpv-cavs-linux-arm64.tar.gz
+
+      - name: Verify CAVS support
+        run: |
+          echo "=== Checking cavs/avs2 strings in libmpv ==="
+          STAGING="release/libmpv-cavs-linux-arm64/lib"
+          find "$STAGING" -name "libmpv*" -exec sh -c 'echo "--- {} ---"; strings "{}" | grep -iE "guangdian|jizhun|cavs|avs2|libdavs2" | head -20' \;
+          echo "=== ldd output (libmpv dependencies) ==="
+          ldd "$STAGING"/libmpv.so.2 2>/dev/null | head -30
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-cavs-linux-arm64
+          path: release/libmpv-cavs-linux-arm64.tar.gz
+          retention-days: 1
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: release/libmpv-cavs-linux-arm64.tar.gz
+          fail_on_unmatched_files: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

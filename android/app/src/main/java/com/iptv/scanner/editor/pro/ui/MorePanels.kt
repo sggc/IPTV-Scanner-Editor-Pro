@@ -537,7 +537,15 @@ fun AudioSettingsPanel(viewModel: AppViewModel) {
     var eqPreset by remember { mutableStateOf("normal") }
 
     // 音调（变调不变速，0.5~2.0，1.0=正常）
-    var audioPitch by remember { mutableStateOf(mpv.getPropertyDouble("audio-pitch-correction") ?: 1.0) }
+    // audio-pitch-correction 是 mpv Flag（yes/no），用 getPropertyString 解析
+    var audioPitch by remember {
+        mutableStateOf(
+            when ((mpv.getPropertyString("audio-pitch-correction") ?: "yes").lowercase()) {
+                "no", "false", "0" -> 0.0
+                else -> 1.0
+            }
+        )
+    }
 
     // 周期刷新当前 aid
     LaunchedEffect(trackListJson) {

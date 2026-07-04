@@ -613,10 +613,12 @@ class MpvController : MPVLib.EventObserver, Player {
 
     /**
      * 设置音频音调（变调不变速）。与 PC 端 set_audio_pitch 一致。
-     * pitch: 0.0~2.0，1.0=正常。实际设置 mpv 的 audio-pitch-correction 属性。
+     * 注意：audio-pitch-correction 是 mpv Flag（yes/no），不是浮点。
+     * 保留 0.0~2.0 接口仅用于 UI 兼容：>=0.5 映射 yes，<0.5 映射 no。
      */
     override fun setAudioPitch(pitch: Double): Boolean {
-        postOnUiThread { MPVLib.setPropertyDouble("audio-pitch-correction", pitch.coerceIn(0.0, 2.0)) }
+        val flagVal = if (pitch >= 0.5) "yes" else "no"
+        postOnUiThread { MPVLib.setPropertyString("audio-pitch-correction", flagVal) }
         return true
     }
 

@@ -118,11 +118,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install MPV and FFmpeg via Homebrew
+      - name: Download CAVS-enabled libmpv (macOS)
+        # 优先从项目 Release 下载带 CAVS + AVS2 支持的 libmpv
+        # 如果 Release 不存在，fallback 到 Homebrew（无 CAVS/AVS2 支持）
         run: |
-          brew install mpv ffmpeg
+          brew install ffmpeg
           mkdir -p mpv
-          cp /opt/homebrew/lib/libmpv.2.dylib mpv/ || cp /usr/local/lib/libmpv.2.dylib mpv/
+          CAVS_URL="https://github.com/${{ github.repository }}/releases/download/libmpv-cavs-latest/libmpv-cavs-macos-arm64.tar.gz"
+          if curl -fsSL "$CAVS_URL" -o /tmp/cavs-libmpv.tar.gz; then
+            echo "Downloaded CAVS-enabled libmpv from: $CAVS_URL"
+            mkdir -p /tmp/cavs-libmpv
+            tar xzf /tmp/cavs-libmpv.tar.gz -C /tmp/cavs-libmpv
+            cp /tmp/cavs-libmpv/libmpv-cavs-macos-arm64/lib/*.dylib mpv/
+            echo "Using CAVS-enabled libmpv"
+          else
+            echo "CAVS-enabled libmpv not found, falling back to Homebrew"
+            brew install mpv
+            cp /opt/homebrew/lib/libmpv.2.dylib mpv/ || cp /usr/local/lib/libmpv.2.dylib mpv/
+          fi
+          ls -la mpv/
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -165,12 +179,25 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt update
-          sudo apt install -y libmpv-dev ffmpeg libxcb-cursor0
+          sudo apt install -y ffmpeg libxcb-cursor0 libass-dev zlib1g-dev libjpeg-dev
 
-      - name: Prepare dependencies
+      - name: Download CAVS-enabled libmpv (Linux x86_64)
+        # 优先从项目 Release 下载带 CAVS + AVS2 支持的 libmpv
+        # 如果 Release 不存在，fallback 到 apt（无 CAVS/AVS2 支持）
         run: |
           mkdir -p mpv ffmpeg
-          cp /usr/lib/x86_64-linux-gnu/libmpv.so.2 mpv/ 2>/dev/null || cp /usr/lib/libmpv.so.2 mpv/ 2>/dev/null || true
+          CAVS_URL="https://github.com/${{ github.repository }}/releases/download/libmpv-cavs-latest/libmpv-cavs-linux-x86_64.tar.gz"
+          if curl -fsSL "$CAVS_URL" -o /tmp/cavs-libmpv.tar.gz; then
+            echo "Downloaded CAVS-enabled libmpv from: $CAVS_URL"
+            mkdir -p /tmp/cavs-libmpv
+            tar xzf /tmp/cavs-libmpv.tar.gz -C /tmp/cavs-libmpv
+            cp /tmp/cavs-libmpv/libmpv-cavs-linux-x86_64/lib/*.so* mpv/
+            echo "Using CAVS-enabled libmpv"
+          else
+            echo "CAVS-enabled libmpv not found, falling back to apt"
+            sudo apt install -y libmpv-dev
+            cp /usr/lib/x86_64-linux-gnu/libmpv.so.2 mpv/ 2>/dev/null || cp /usr/lib/libmpv.so.2 mpv/ 2>/dev/null || true
+          fi
           cp /usr/bin/ffprobe ffmpeg/
           cp /usr/bin/ffmpeg ffmpeg/ 2>/dev/null || true
           chmod +x ffmpeg/ffprobe ffmpeg/ffmpeg 2>/dev/null || true
@@ -226,7 +253,26 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt update
-          sudo apt install -y libmpv-dev libxcb-cursor0
+          sudo apt install -y libxcb-cursor0 libass-dev zlib1g-dev libjpeg-dev
+
+      - name: Download CAVS-enabled libmpv (Linux ARM64)
+        # 优先从项目 Release 下载带 CAVS + AVS2 支持的 libmpv
+        # 如果 Release 不存在，fallback 到 apt（无 CAVS/AVS2 支持）
+        run: |
+          mkdir -p mpv ffmpeg
+          CAVS_URL="https://github.com/${{ github.repository }}/releases/download/libmpv-cavs-latest/libmpv-cavs-linux-arm64.tar.gz"
+          if curl -fsSL "$CAVS_URL" -o /tmp/cavs-libmpv.tar.gz; then
+            echo "Downloaded CAVS-enabled libmpv from: $CAVS_URL"
+            mkdir -p /tmp/cavs-libmpv
+            tar xzf /tmp/cavs-libmpv.tar.gz -C /tmp/cavs-libmpv
+            cp /tmp/cavs-libmpv/libmpv-cavs-linux-arm64/lib/*.so* mpv/
+            echo "Using CAVS-enabled libmpv"
+          else
+            echo "CAVS-enabled libmpv not found, falling back to apt"
+            sudo apt install -y libmpv-dev
+            cp /usr/lib/aarch64-linux-gnu/libmpv.so.2 mpv/ 2>/dev/null || cp /usr/lib/libmpv.so.2 mpv/ 2>/dev/null || true
+          fi
+          ls -la mpv/
 
       - name: Prepare FFmpeg
         run: |
@@ -320,37 +366,51 @@ jobs:
       - name: Install Android SDK packages
         run: yes | sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Download mpv native libraries for Android
-        working-directory: android
-        run: |
-          # 下载所有 4 种架构的 mpv APK 来提取 .so 文件
-          BASE_URL="https://github.com/mpv-android/mpv-android/releases/download/2026-04-25"
-          ARCHS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
-
-          for arch in "${ARCHS[@]}"; do
-            APK="app-default-${arch}-release.apk"
-            curl -fsSL -o "mpv-${arch}.apk" "${BASE_URL}/${APK}"
-            echo "Downloaded mpv-${arch}.apk ($(ls -lh "mpv-${arch}.apk" | awk '{print $5}'))"
-          done
-
-      - name: Extract mpv native libraries for Android
+      - name: Download CAVS-enabled libmpv for Android
+        # 优先从项目 Release 下载带 CAVS 支持的 libmpv .so 文件
+        # 如果 Release 不存在，fallback 到官方 mpv-android APK（无 CAVS 支持）
         working-directory: android
         run: |
           JNILIBS_DIR="app/src/main/jniLibs"
-          ARCHS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
-
-          for arch in "${ARCHS[@]}"; do
-            mkdir -p "$JNILIBS_DIR/$arch"
-            unzip -o "mpv-${arch}.apk" "lib/${arch}/*.so" -d /tmp/mpv-extract
-            if [ -d "/tmp/mpv-extract/lib/${arch}" ]; then
-              cp /tmp/mpv-extract/lib/${arch}/*.so "$JNILIBS_DIR/$arch/"
-              echo "$arch .so files:"
-              ls -la "$JNILIBS_DIR/$arch/"
-            else
-              echo "WARNING: No .so files found for $arch"
-            fi
-            rm -rf /tmp/mpv-extract
-          done
+          mkdir -p "$JNILIBS_DIR"
+          CAVS_URL="https://github.com/${{ github.repository }}/releases/download/libmpv-cavs-latest/libmpv-cavs-android.tar.gz"
+          if curl -fsSL "$CAVS_URL" -o /tmp/cavs-libmpv-android.tar.gz; then
+            echo "Downloaded CAVS-enabled libmpv from: $CAVS_URL"
+            mkdir -p /tmp/cavs-android
+            tar xzf /tmp/cavs-libmpv-android.tar.gz -C /tmp/cavs-android
+            for arch in arm64-v8a armeabi-v7a x86_64 x86; do
+              if [ -d "/tmp/cavs-android/jniLibs/$arch" ]; then
+                mkdir -p "$JNILIBS_DIR/$arch"
+                cp /tmp/cavs-android/jniLibs/$arch/*.so "$JNILIBS_DIR/$arch/"
+                echo "$arch .so files (CAVS):"
+                ls -la "$JNILIBS_DIR/$arch/"
+              else
+                echo "WARNING: No CAVS .so files found for $arch"
+              fi
+            done
+            echo "Using CAVS-enabled libmpv"
+          else
+            echo "CAVS-enabled libmpv not found, falling back to official mpv-android APK"
+            BASE_URL="https://github.com/mpv-android/mpv-android/releases/download/2026-04-25"
+            ARCHS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
+            for arch in "${ARCHS[@]}"; do
+              APK="app-default-${arch}-release.apk"
+              curl -fsSL -o "mpv-${arch}.apk" "${BASE_URL}/${APK}"
+              echo "Downloaded mpv-${arch}.apk ($(ls -lh "mpv-${arch}.apk" | awk '{print $5}'))"
+              mkdir -p "$JNILIBS_DIR/$arch"
+              unzip -o "mpv-${arch}.apk" "lib/${arch}/*.so" -d /tmp/mpv-extract
+              if [ -d "/tmp/mpv-extract/lib/${arch}" ]; then
+                cp /tmp/mpv-extract/lib/${arch}/*.so "$JNILIBS_DIR/$arch/"
+                echo "$arch .so files:"
+                ls -la "$JNILIBS_DIR/$arch/"
+              else
+                echo "WARNING: No .so files found for $arch"
+              fi
+              rm -rf /tmp/mpv-extract
+            done
+          fi
+          echo "=== Final jniLibs structure ==="
+          find "$JNILIBS_DIR" -name "*.so" -ls
 
       - name: Create local.properties
         working-directory: android

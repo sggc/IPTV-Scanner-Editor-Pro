@@ -34,6 +34,13 @@ if is_macos() and os.path.isdir(mpv_dir):
     if mpv_dir not in existing:
         os.environ['DYLD_LIBRARY_PATH'] = mpv_dir + (os.pathsep + existing if existing else '')
 
+# Linux: 设置 LD_LIBRARY_PATH，确保能找到自定义构建的 FFmpeg 库（如 CAVS 版本）
+# PyInstaller 只将 _MEIPASS 加入 LD_LIBRARY_PATH，不包含 _MEIPASS/mpv/
+if is_linux() and os.path.isdir(mpv_dir):
+    existing = os.environ.get('LD_LIBRARY_PATH', '')
+    if mpv_dir not in existing:
+        os.environ['LD_LIBRARY_PATH'] = mpv_dir + (os.pathsep + existing if existing else '')
+
 MPV_AVAILABLE = False
 libmpv = None
 _mpv_loaded = False

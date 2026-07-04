@@ -335,7 +335,9 @@ class MpvPlayerController(QObject):
             _mpv_set_property_string(self.mpv_handle, 'idle', 'yes')
             _mpv_set_property_string(self.mpv_handle, 'ytdl', 'no')
 
-            _mpv_set_property_string(self.mpv_handle, 'video-aspect-override', '-1')
+            # mpv 新版废弃 video-aspect-override=-1，需用 'no' + video-aspect-mode=container
+            _mpv_set_property_string(self.mpv_handle, 'video-aspect-override', 'no')
+            _mpv_set_property_string(self.mpv_handle, 'video-aspect-mode', 'container')
             _mpv_set_property_string(self.mpv_handle, 'keepaspect', 'yes')
             _mpv_set_property_string(self.mpv_handle, 'panscan', '0.0')
 
@@ -1484,29 +1486,36 @@ class MpvPlayerController(QObject):
         try:
             if not self.mpv_handle:
                 return
+            # mpv 新版废弃 video-aspect-override=-1，需用 'no' + video-aspect-mode=container 替代
             ratio_lower = ratio.lower() if ratio else 'default'
             if ratio_lower == '16:9':
                 self._set_mpv_string('video-aspect-override', '16:9')
+                self._set_mpv_string('video-aspect-mode', 'container')
                 self._set_mpv_string('keepaspect', 'yes')
                 self._set_mpv_string('panscan', '0.0')
             elif ratio_lower == '4:3':
                 self._set_mpv_string('video-aspect-override', '4:3')
+                self._set_mpv_string('video-aspect-mode', 'container')
                 self._set_mpv_string('keepaspect', 'yes')
                 self._set_mpv_string('panscan', '0.0')
             elif ratio_lower == 'stretch':
-                self._set_mpv_string('video-aspect-override', '-1')
+                self._set_mpv_string('video-aspect-override', 'no')
+                self._set_mpv_string('video-aspect-mode', 'container')
                 self._set_mpv_string('keepaspect', 'no')
                 self._set_mpv_string('panscan', '0.0')
             elif ratio_lower == 'fill':
-                self._set_mpv_string('video-aspect-override', '-1')
+                self._set_mpv_string('video-aspect-override', 'no')
+                self._set_mpv_string('video-aspect-mode', 'container')
                 self._set_mpv_string('keepaspect', 'yes')
                 self._set_mpv_string('panscan', '1.0')
             elif ratio_lower == 'crop':
-                self._set_mpv_string('video-aspect-override', '-1')
+                self._set_mpv_string('video-aspect-override', 'no')
+                self._set_mpv_string('video-aspect-mode', 'container')
                 self._set_mpv_string('keepaspect', 'yes')
                 self._set_mpv_string('panscan', '1.0')
             else:
-                self._set_mpv_string('video-aspect-override', '-1')
+                self._set_mpv_string('video-aspect-override', 'no')
+                self._set_mpv_string('video-aspect-mode', 'container')
                 self._set_mpv_string('keepaspect', 'yes')
                 self._set_mpv_string('panscan', '0.0')
             self.logger.debug(f"设置画面比例: {ratio}")
@@ -2696,8 +2705,13 @@ class MpvPlayerController(QObject):
         return result
 
     # ---------- 音频系统增强（audio-delay/device/channels/pitch/equalizer） ----------
-    # mpv 属性取值范围：audio-delay 秒（-10~10，默认 0）；audio-pitch-correction 0.0~2.0（1.0=正常）
-    # audio-channels 字符串（auto/mono/1.0/2.0/2.1/5.1/7.1 等）；audio-device 字符串
+    # mpv 属性：
+    # - audio-delay：秒（-10~10，默认 0）
+    # - audio-pitch-correction：Flag（yes/no，默认 yes），控制变速时是否自动修正音调。
+    #   注意：mpv 没有直接的"变调不变速"浮点属性，此处保留 0.0~2.0 接口仅用于 UI 兼容，
+    #   实际设置时 >=0.5 映射为 yes、<0.5 映射为 no。
+    # - audio-channels：字符串（auto/mono/1.0/2.0/2.1/5.1/7.1 等）
+    # - audio-device：字符串
     # 均衡器通过 af 滤镜 equalizer=g1:g2:...:g10 实现（10 频段，-12~+12 dB）
     EQ_BANDS = (60, 170, 310, 600, 1000, 3000, 6000, 12000, 14000, 16000)
     EQ_LABELS = ('60Hz', '170Hz', '310Hz', '600Hz', '1kHz', '3kHz', '6kHz', '12kHz', '14kHz', '16kHz')
@@ -2752,13 +2766,20 @@ class MpvPlayerController(QObject):
         return self._get_mpv_property_string('audio-channels') or 'auto'
 
     def set_audio_pitch(self, v: float) -> bool:
-        """设置音调补偿（0.0~2.0，1.0=正常）"""
+        """设置音调补偿。
+        注意：audio-pitch-correction 是 mpv Flag（yes/no），不是浮点。
+        保留 0.0~2.0 接口仅用于 UI 兼容：>=0.5 映射 yes，<0.5 映射 no。
+        """
         v = max(0.0, min(2.0, float(v)))
-        return self._set_mpv_string('audio-pitch-correction', f"{v:.3f}") >= 0
+        flag_val = 'yes' if v >= 0.5 else 'no'
+        return self._set_mpv_string('audio-pitch-correction', flag_val) >= 0
 
     def get_audio_pitch(self) -> float:
-        v = self._get_mpv_property_double('audio-pitch-correction')
-        return float(v) if v is not None else 1.0
+        """读取音调补偿（UI 兼容：yes→1.0，no→0.0）"""
+        v = self._get_mpv_property_string('audio-pitch-correction')
+        if v and v.lower() in ('yes', 'true', '1'):
+            return 1.0
+        return 0.0
 
     def adjust_audio_pitch(self, delta: float) -> float:
         cur = self.get_audio_pitch()
