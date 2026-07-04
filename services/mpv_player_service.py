@@ -89,6 +89,13 @@ def _load_playback_settings():
         'audio_passthrough': 'never',
         'http_referer': '',
         'http_proxy': '',
+        # 高级播放器参数（与安卓端 PlayerSettingsPanel 对齐）
+        'vo': 'auto',
+        'video_sync': 'audio',
+        'framedrop': 'vo',
+        'cache_secs_override': 0,
+        'demuxer_readahead_secs_override': 0,
+        'demuxer_max_bytes_mib_override': 0,
     }
     try:
         from core.config_manager import ConfigManager
@@ -228,29 +235,47 @@ class MpvPlayerController(QObject):
                 self.logger.warning(f"HDR检测失败，保守使用SDR模式: {e}")
 
             self._hdr_fallback_tonemap = False
-            if hdr_mode == 'disable':
-                vo = 'gpu'
-            elif hdr_mode == 'tonemap':
-                vo = 'gpu'
-            elif hdr_mode == 'passthrough':
-                if system_hdr_enabled:
-                    vo = 'gpu-next'
-                else:
-                    self.logger.warning("系统未启用HDR，passthrough模式回退到tonemap")
+            # vo 推导：仅在用户未指定具体 vo（'auto'）时按 HDR 模式自动推导。
+            # 用户在订阅设置中手动选择 vo 后优先使用用户值，HDR 模式仍控制
+            # target-prim/trc/colorspace-hint 等色彩参数（与 vo 解耦）。
+            user_vo = str(self._playback_settings.get('vo', 'auto')).lower()
+            if user_vo not in ('auto', 'gpu', 'gpu-next', 'libmpv', 'direct3d'):
+                user_vo = 'auto'
+            if user_vo == 'auto':
+                if hdr_mode == 'disable':
                     vo = 'gpu'
-                    self._hdr_fallback_tonemap = True
-            elif hdr_mode == 'scrgb':
-                if system_hdr_enabled:
-                    vo = 'gpu-next'
-                else:
-                    self.logger.warning("系统未启用HDR，scrgb模式回退到tonemap")
+                elif hdr_mode == 'tonemap':
                     vo = 'gpu'
-                    self._hdr_fallback_tonemap = True
+                elif hdr_mode == 'passthrough':
+                    if system_hdr_enabled:
+                        vo = 'gpu-next'
+                    else:
+                        self.logger.warning("系统未启用HDR，passthrough模式回退到tonemap")
+                        vo = 'gpu'
+                        self._hdr_fallback_tonemap = True
+                elif hdr_mode == 'scrgb':
+                    if system_hdr_enabled:
+                        vo = 'gpu-next'
+                    else:
+                        self.logger.warning("系统未启用HDR，scrgb模式回退到tonemap")
+                        vo = 'gpu'
+                        self._hdr_fallback_tonemap = True
+                else:
+                    if system_hdr_enabled:
+                        vo = 'gpu-next'
+                    else:
+                        vo = 'gpu'
             else:
-                if system_hdr_enabled:
-                    vo = 'gpu-next'
-                else:
-                    vo = 'gpu'
+                # 用户手动指定 vo：HDR 模式若需 gpu-next 但用户选了其他 vo，
+                # 标记回退到 tonemap 以避免 HDR 信号被错送到 SDR 输出。
+                vo = user_vo
+                if hdr_mode in ('passthrough', 'scrgb') and system_hdr_enabled and vo != 'gpu-next':
+                    self.logger.warning(
+                        f"HDR模式({hdr_mode})需要gpu-next，但用户选了vo={vo}，HDR信号可能异常"
+                    )
+                if hdr_mode == 'disable':
+                    # disable 模式原本强制 gpu，用户选其他 vo 时保留用户选择
+                    pass
 
             # gpu-api和gpu-context必须在vo之前设置
             # 否则mpv内部锁定渲染后端后，gpu-context设置会被拒绝(错误码-7)
@@ -260,6 +285,12 @@ class MpvPlayerController(QObject):
             elif is_macos():
                 # macOS上mpv v0.41+的gpu-context选项不再支持wid嵌入
                 # 使用vo=libmpv + render API渲染到QOpenGLWidget（IINA等播放器的标准方案）
+                # 注意：即使用户在订阅设置中选了 gpu/gpu-next，macOS 也强制走 libmpv，
+                # 因为 wid 嵌入在 mpv v0.41+ 已失效。这里日志提示用户其选择被覆盖。
+                if vo != 'libmpv':
+                    self.logger.info(
+                        f"macOS: 用户选择的vo={vo}被覆盖为libmpv（mpv v0.41+不再支持wid嵌入）"
+                    )
                 ret_vo = _mpv_set_option_string(self.mpv_handle, 'vo', 'libmpv')
                 if ret_vo >= 0:
                     self.logger.info("macOS: 设置vo=libmpv成功，将使用render API渲染")
@@ -363,12 +394,19 @@ class MpvPlayerController(QObject):
                 _mpv_set_property_string(self.mpv_handle, 'source-timeout', str(source_to))
 
             # 性能与卡顿优化：
-            # - framedrop=vo：视频输出慢时丢帧，避免渲染积压阻塞 GUI（默认值，但显式指定避免 mpv 版本差异）
+            # - framedrop：视频输出慢时丢帧策略，默认 vo（VO 慢时丢帧），用户可配置
             # - cache-pause-initial=no：初始缓存阶段不暂停，避免直播流启动卡顿
-            # - video-sync=audio：以音频时钟为同步基准，视频帧迟到时丢帧而非阻塞
-            _mpv_set_property_string(self.mpv_handle, 'framedrop', 'vo')
+            # - video-sync：音画同步基准，默认 audio（以音频时钟为基准），用户可配置
+            framedrop_raw = str(self._playback_settings.get('framedrop', 'vo')).lower()
+            if framedrop_raw not in ('vo', 'decoder', 'insert', 'none', 'never'):
+                framedrop_raw = 'vo'
+            _mpv_set_property_string(self.mpv_handle, 'framedrop', framedrop_raw)
             _mpv_set_property_string(self.mpv_handle, 'cache-pause-initial', 'no')
-            _mpv_set_property_string(self.mpv_handle, 'video-sync', 'audio')
+            video_sync_raw = str(self._playback_settings.get('video_sync', 'audio')).lower()
+            if video_sync_raw not in ('audio', 'display-resample', 'display-tempo', 'resample',
+                                      'display-desync', 'desync'):
+                video_sync_raw = 'audio'
+            _mpv_set_property_string(self.mpv_handle, 'video-sync', video_sync_raw)
 
             passthrough = self._playback_settings.get('audio_passthrough', 'never')
             if passthrough and passthrough != 'never':
@@ -516,6 +554,33 @@ class MpvPlayerController(QObject):
     def _set_mpv_string(self, name, value):
         if self._terminated or not self.mpv_handle:
             return -1
+        return _mpv_set_property_string(self.mpv_handle, name, str(value))
+
+    def _set_cache_param(self, name, value):
+        """设置缓存相关参数（cache-secs / demuxer-max-bytes / demuxer-readahead-secs）。
+
+        与 _set_mpv_string 的区别：用户在订阅设置中配置了 override(>0) 时，
+        用 override 替换动态计算值。_reset_demuxer_options 中的清空操作
+        不经过此方法，因此 override 不会破坏重置逻辑。
+        """
+        if self._terminated or not self.mpv_handle:
+            return -1
+        s = self._playback_settings
+        try:
+            if name == 'cache-secs':
+                ov = float(s.get('cache_secs_override', 0) or 0)
+                if ov > 0:
+                    value = str(int(ov))
+            elif name == 'demuxer-max-bytes':
+                ov = float(s.get('demuxer_max_bytes_mib_override', 0) or 0)
+                if ov > 0:
+                    value = f'{int(ov)}MiB'
+            elif name == 'demuxer-readahead-secs':
+                ov = float(s.get('demuxer_readahead_secs_override', 0) or 0)
+                if ov > 0:
+                    value = str(int(ov))
+        except (TypeError, ValueError):
+            pass
         return _mpv_set_property_string(self.mpv_handle, name, str(value))
 
 
@@ -799,8 +864,8 @@ class MpvPlayerController(QObject):
             if is_large_file:
                 cache_secs = max(cache_secs, 240)
                 max_bytes_mib = max(max_bytes_mib, 3072)
-            self._set_mpv_string('cache-secs', str(cache_secs))
-            self._set_mpv_string('demuxer-max-bytes', f'{max_bytes_mib}MiB')
+            self._set_cache_param('cache-secs', str(cache_secs))
+            self._set_cache_param('demuxer-max-bytes', f'{max_bytes_mib}MiB')
             self._set_mpv_string('demuxer-max-back-bytes', f'{max_bytes_mib // 2}MiB')
             self._set_mpv_string('demuxer-lavf-probesize', str(probesize))
             self._set_mpv_string('demuxer-lavf-analyzeduration', str(analyzeduration))
@@ -815,10 +880,10 @@ class MpvPlayerController(QObject):
             self._set_mpv_string('demuxer-lavf-probesize', '100000000')
             self._set_mpv_string('demuxer-lavf-analyzeduration', '20')
             self._set_mpv_string('cache', 'yes')
-            self._set_mpv_string('cache-secs', '180')
-            self._set_mpv_string('demuxer-max-bytes', '2048MiB')
+            self._set_cache_param('cache-secs', '180')
+            self._set_cache_param('demuxer-max-bytes', '2048MiB')
             self._set_mpv_string('demuxer-max-back-bytes', '1024MiB')
-            self._set_mpv_string('demuxer-readahead-secs', '60')
+            self._set_cache_param('demuxer-readahead-secs', '60')
             self._set_mpv_string('force-seekable', 'yes')
             self._set_mpv_string('demuxer-seekable-cache', 'yes')
             self.logger.debug("[mpv] 蓝光原盘选项已设置: cache=180s, probesize=100M, max=2048MiB")
@@ -833,10 +898,10 @@ class MpvPlayerController(QObject):
             self._set_mpv_string('demuxer-lavf-analyzeduration', '10')
             self._set_mpv_string('demuxer-lavf-buffersize', '50000000')
             self._set_mpv_string('cache', 'yes')
-            self._set_mpv_string('cache-secs', '60')
-            self._set_mpv_string('demuxer-max-bytes', '512MiB')
+            self._set_cache_param('cache-secs', '60')
+            self._set_cache_param('demuxer-max-bytes', '512MiB')
             self._set_mpv_string('demuxer-max-back-bytes', '256MiB')
-            self._set_mpv_string('demuxer-readahead-secs', '30')
+            self._set_cache_param('demuxer-readahead-secs', '30')
             self._set_mpv_string('force-seekable', 'yes')
             self._set_mpv_string('demuxer-seekable-cache', 'yes')
             self.logger.debug("[mpv] 网络挂载盘选项已设置: cache=yes, probesize=50M, readahead=30s")
@@ -875,14 +940,14 @@ class MpvPlayerController(QObject):
             rtsp_ua = settings.get('rtsp_user_agent', 'VLC/3.0.18Libmpv')
             self._set_mpv_string('user-agent', rtsp_ua)
             self._set_mpv_string('cache', 'yes')
-            self._set_mpv_string('cache-secs', str(cache_secs))
+            self._set_cache_param('cache-secs', str(cache_secs))
             self._set_mpv_string('demuxer-lavf-format', '')
             if rtsp_transport == 'udp':
                 self._set_mpv_string('demuxer-lavf-probesize', '500000')
                 self._set_mpv_string('demuxer-lavf-analyzeduration', '1')
-                self._set_mpv_string('demuxer-max-bytes', f'{max_bytes_mib}MiB')
+                self._set_cache_param('demuxer-max-bytes', f'{max_bytes_mib}MiB')
                 self._set_mpv_string('demuxer-max-back-bytes', f'{max_bytes_mib}MiB')
-                self._set_mpv_string('demuxer-readahead-secs', '5')
+                self._set_cache_param('demuxer-readahead-secs', '5')
                 self._set_mpv_string('force-seekable', 'no')
                 self.logger.debug(f"[mpv] rtsp-udp-live cache={cache_secs} transport={rtsp_transport}")
             elif is_vod:
@@ -915,27 +980,27 @@ class MpvPlayerController(QObject):
             self._set_mpv_string('cache', 'yes')
             self._set_mpv_string('force-seekable', 'yes')
             self._set_mpv_string('demuxer-seekable-cache', 'yes')
-            self._set_mpv_string('cache-secs', str(cache_secs))
-            self._set_mpv_string('demuxer-max-bytes', f'{max_bytes_mib}MiB')
+            self._set_cache_param('cache-secs', str(cache_secs))
+            self._set_cache_param('demuxer-max-bytes', f'{max_bytes_mib}MiB')
             self._set_mpv_string('demuxer-max-back-bytes', f'{max_bytes_mib}MiB')
-            self._set_mpv_string('demuxer-readahead-secs', '300')
+            self._set_cache_param('demuxer-readahead-secs', '300')
             self.logger.debug(f"[mpv] ts demux=mpegts cache={cache_secs}s back={max_bytes_mib}MiB dur={program_duration}s")
             return
 
         if '.m3u8' in u or 'format=hls' in u:
             self._set_mpv_string('demuxer-lavf-format', '')
             self._set_mpv_string('cache', 'yes')
-            self._set_mpv_string('cache-secs', str(cache_secs))
-            self._set_mpv_string('demuxer-max-bytes', f'{max_bytes_mib}MiB')
+            self._set_cache_param('cache-secs', str(cache_secs))
+            self._set_cache_param('demuxer-max-bytes', f'{max_bytes_mib}MiB')
             self._set_mpv_string('demuxer-max-back-bytes', f'{max_bytes_mib}MiB')
             self._set_mpv_string('force-seekable', 'yes')
-            self._set_mpv_string('demuxer-readahead-secs', '120')
+            self._set_cache_param('demuxer-readahead-secs', '120')
 
             if settings.get('hls_start_at_live_edge', False):
                 self._set_mpv_string('hls-playlist-start', 'no')
             readahead = settings.get('hls_readahead_secs', 0)
             if readahead > 0:
-                self._set_mpv_string('demuxer-readahead-secs', str(readahead))
+                self._set_cache_param('demuxer-readahead-secs', str(readahead))
             self.logger.debug(f"[mpv] hls cache=yes seekable=yes vod={is_vod}")
             return
 
@@ -945,11 +1010,11 @@ class MpvPlayerController(QObject):
         self._set_mpv_string('demuxer-lavf-probesize', '5000000')
         self._set_mpv_string('demuxer-lavf-analyzeduration', '5')
         self._set_mpv_string('cache', 'yes')
-        self._set_mpv_string('cache-secs', str(cache_secs))
-        self._set_mpv_string('demuxer-max-bytes', f'{max_bytes_mib}MiB')
+        self._set_cache_param('cache-secs', str(cache_secs))
+        self._set_cache_param('demuxer-max-bytes', f'{max_bytes_mib}MiB')
         self._set_mpv_string('demuxer-max-back-bytes', f'{max_bytes_mib}MiB')
         self._set_mpv_string('force-seekable', 'yes')
-        self._set_mpv_string('demuxer-readahead-secs', '120')
+        self._set_cache_param('demuxer-readahead-secs', '120')
         self._set_mpv_string('demuxer-cache-wait', 'no')
         self.logger.debug(f"[mpv] generic http cache=yes seekable=yes")
 

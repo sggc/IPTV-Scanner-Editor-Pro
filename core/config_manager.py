@@ -700,6 +700,17 @@ class ConfigManager(Singleton):
             'skip_intro_seconds': 0.0,
             'auto_skip_outro': False,
             'skip_outro_seconds': 0.0,
+            # 高级播放器参数（与安卓端 PlayerSettingsPanel 对齐）
+            # vo: 'auto' 表示按 hdr_output_mode 自动推导
+            'vo': 'auto',
+            # video-sync: 'audio' 默认以音频时钟为基准
+            'video_sync': 'audio',
+            # framedrop: 'vo' 默认 VO 慢时丢帧
+            'framedrop': 'vo',
+            # 缓存覆盖：0 或空表示使用动态智能调整（按流类型/分辨率/HDR 计算）
+            'cache_secs_override': 0,
+            'demuxer_readahead_secs_override': 0,
+            'demuxer_max_bytes_mib_override': 0,
         }
         if settings:
             defaults.update(settings)
@@ -740,6 +751,13 @@ class ConfigManager(Singleton):
             'skip_intro_seconds': 0.0,
             'auto_skip_outro': False,
             'skip_outro_seconds': 0.0,
+            # 高级播放器参数（与安卓端 PlayerSettingsPanel 对齐）
+            'vo': 'auto',
+            'video_sync': 'audio',
+            'framedrop': 'vo',
+            'cache_secs_override': 0,
+            'demuxer_readahead_secs_override': 0,
+            'demuxer_max_bytes_mib_override': 0,
         }
         result = {}
         need_save = False

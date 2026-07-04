@@ -325,8 +325,171 @@ class SettingsFileOperations:
         hdr_combo.setCurrentIndex(selected_hdr_idx)
         layout.addRow(tr("hdr_output_mode_colon", "HDR Output:"), hdr_combo)
 
+        # ---- 高级参数：视频输出 / 视频同步 / 丢帧策略 / 缓存 override ----
+        # 这些参数原仅由播放器内部按 HDR 模式和流类型自动推导；PC 端开放给用户
+        # 自定义。'auto' 保留原自动推导行为（推荐），手动选择会覆盖自动值。
+        vo_combo = QComboBox()
+        vo_combo.setObjectName("vo_combo")
+        vo_items = [
+            ('auto', tr("vo_auto", "Auto (Recommended - derive from HDR mode)")),
+            ('gpu', tr("vo_gpu", "gpu (Default cross-platform VO)")),
+            ('gpu-next', tr("vo_gpu_next", "gpu-next (Next-gen, HDR passthrough/scRGB)")),
+            ('libmpv', tr("vo_libmpv", "libmpv (Render API, macOS default)")),
+            ('direct3d', tr("vo_direct3d", "direct3d (Windows legacy VO)")),
+        ]
+        current_vo = str(playback_settings.get('vo', 'auto')).lower()
+        selected_vo_idx = 0
+        for i, (val, label) in enumerate(vo_items):
+            vo_combo.addItem(label, val)
+            if val == current_vo:
+                selected_vo_idx = i
+        vo_combo.setCurrentIndex(selected_vo_idx)
+        self._add_form_row_with_desc(
+            layout,
+            tr("vo_label", "Video Output (vo):"),
+            vo_combo,
+            tr("vo_desc",
+               "Selects the video output. 'Auto' derives vo from HDR mode (gpu/gpu-next). "
+               "On macOS, vo is always forced to libmpv (mpv v0.41+ no longer supports wid embedding). "
+               "gpu-next is required for HDR passthrough/scRGB on Windows.")
+        )
+
+        vsync_combo = QComboBox()
+        vsync_combo.setObjectName("video_sync_combo")
+        vsync_items = [
+            ('audio', tr("vsync_audio", "audio (Default, sync to audio clock)")),
+            ('display-resample', tr("vsync_display_resample", "display-resample (Resample audio to display)")),
+            ('display-tempo', tr("vsync_display_tempo", "display-tempo (Tempo-scale audio)")),
+            ('resample', tr("vsync_resample", "resample (Resample audio, may cause drift)")),
+            ('display-desync', tr("vsync_display_desync", "display-desync (No sync, may drop/dup)")),
+            ('desync', tr("vsync_desync", "desync (Completely asynchronous)")),
+        ]
+        current_vsync = str(playback_settings.get('video_sync', 'audio')).lower()
+        selected_vsync_idx = 0
+        for i, (val, label) in enumerate(vsync_items):
+            vsync_combo.addItem(label, val)
+            if val == current_vsync:
+                selected_vsync_idx = i
+        vsync_combo.setCurrentIndex(selected_vsync_idx)
+        self._add_form_row_with_desc(
+            layout,
+            tr("video_sync_label", "Video Sync (video-sync):"),
+            vsync_combo,
+            tr("video_sync_desc",
+               "A/V sync timing reference. 'audio' is the safest default. "
+               "'display-resample'/'display-tempo' sync to display refresh rate (smoother but may pitch-shift audio).")
+        )
+
+        framedrop_combo = QComboBox()
+        framedrop_combo.setObjectName("framedrop_combo")
+        fd_items = [
+            ('vo', tr("framedrop_vo", "vo (Default, drop when VO is slow)")),
+            ('decoder', tr("framedrop_decoder", "decoder (Drop at decoder, lower CPU)")),
+            ('insert', tr("framedrop_insert", "insert (Insert 1:1 frame, may stutter)")),
+            ('none', tr("framedrop_none", "none (Never drop)")),
+            ('never', tr("framedrop_never", "never (Alias of none)")),
+        ]
+        current_fd = str(playback_settings.get('framedrop', 'vo')).lower()
+        selected_fd_idx = 0
+        for i, (val, label) in enumerate(fd_items):
+            framedrop_combo.addItem(label, val)
+            if val == current_fd:
+                selected_fd_idx = i
+        framedrop_combo.setCurrentIndex(selected_fd_idx)
+        self._add_form_row_with_desc(
+            layout,
+            tr("framedrop_label", "Framedrop (framedrop):"),
+            framedrop_combo,
+            tr("framedrop_desc",
+               "Frame dropping strategy when video output falls behind. "
+               "'vo' drops only at output stage (keeps decode quality). "
+               "'decoder' drops earlier (saves CPU on weak machines).")
+        )
+
+        # 缓存 override：留空或 0 表示保持播放器内部动态计算值（按流类型/HDR/分辨率自适应）
+        cache_secs_edit = QLineEdit()
+        cache_secs_edit.setObjectName("cache_secs_override_edit")
+        cache_secs_edit.setPlaceholderText(
+            tr("cache_secs_override_placeholder", "0 = auto (derived from stream type)")
+        )
+        cache_secs_val = playback_settings.get('cache_secs_override', 0)
+        try:
+            cache_secs_val = int(float(cache_secs_val))
+        except (TypeError, ValueError):
+            cache_secs_val = 0
+        if cache_secs_val > 0:
+            cache_secs_edit.setText(str(cache_secs_val))
+        self._add_form_row_with_desc(
+            layout,
+            tr("cache_secs_override_label", "Cache Seconds (cache-secs):"),
+            cache_secs_edit,
+            tr("cache_secs_override_desc",
+               "Overrides the demuxer cache duration in seconds. Leave 0 to keep "
+               "the auto value (e.g. 3600s for live, 180s for Blu-ray, dynamically adjusted by resolution).")
+        )
+
+        demuxer_max_edit = QLineEdit()
+        demuxer_max_edit.setObjectName("demuxer_max_bytes_override_edit")
+        demuxer_max_edit.setPlaceholderText(
+            tr("demuxer_max_bytes_override_placeholder", "0 = auto (MiB, derived from cache-secs)")
+        )
+        demuxer_max_val = playback_settings.get('demuxer_max_bytes_mib_override', 0)
+        try:
+            demuxer_max_val = int(float(demuxer_max_val))
+        except (TypeError, ValueError):
+            demuxer_max_val = 0
+        if demuxer_max_val > 0:
+            demuxer_max_edit.setText(str(demuxer_max_val))
+        self._add_form_row_with_desc(
+            layout,
+            tr("demuxer_max_bytes_override_label", "Demuxer Max Bytes (MiB):"),
+            demuxer_max_edit,
+            tr("demuxer_max_bytes_override_desc",
+               "Overrides the demuxer forward cache size in MiB. Leave 0 to keep "
+               "the auto value (scales with cache-secs, capped at 4096MiB).")
+        )
+
+        readahead_edit = QLineEdit()
+        readahead_edit.setObjectName("demuxer_readahead_secs_override_edit")
+        readahead_edit.setPlaceholderText(
+            tr("demuxer_readahead_secs_override_placeholder", "0 = auto (per stream type: HLS=120s, TS=300s, ...)")
+        )
+        readahead_val = playback_settings.get('demuxer_readahead_secs_override', 0)
+        try:
+            readahead_val = int(float(readahead_val))
+        except (TypeError, ValueError):
+            readahead_val = 0
+        if readahead_val > 0:
+            readahead_edit.setText(str(readahead_val))
+        self._add_form_row_with_desc(
+            layout,
+            tr("demuxer_readahead_secs_override_label", "Demuxer Readahead (s):"),
+            readahead_edit,
+            tr("demuxer_readahead_secs_override_desc",
+               "Overrides the demuxer readahead in seconds. Leave 0 to keep "
+               "the auto value (120s for HLS/HTTP, 300s for TS, 30s for network drives, etc.).")
+        )
+
         group.setLayout(layout)
         return group
+
+    @staticmethod
+    def _add_form_row_with_desc(layout, label_text, widget, desc_text):
+        """在 QFormLayout 中添加一行：label + (widget + 灰色说明文字)。
+
+        说明文字独立一行显示在 widget 下方，便于用户理解参数含义。
+        """
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(3)
+        v.addWidget(widget)
+        desc = QLabel(desc_text)
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: gray; font-size: 11px;")
+        v.addWidget(desc)
+        layout.addRow(label_text, container)
+
 
     def _build_subscription_section(self, tr, source_type, playback=True):
         if source_type == 'playlist':
@@ -500,6 +663,34 @@ class SettingsFileOperations:
         combo = dialog.findChild(QComboBox, "hdr_output_mode_combo")
         if combo:
             settings['hdr_output_mode'] = combo.currentData() if combo.currentData() is not None else 'disable'
+
+        # 高级参数（vo / video-sync / framedrop / 缓存 override）
+        combo = dialog.findChild(QComboBox, "vo_combo")
+        if combo:
+            settings['vo'] = combo.currentData() if combo.currentData() else 'auto'
+        combo = dialog.findChild(QComboBox, "video_sync_combo")
+        if combo:
+            settings['video_sync'] = combo.currentData() if combo.currentData() else 'audio'
+        combo = dialog.findChild(QComboBox, "framedrop_combo")
+        if combo:
+            settings['framedrop'] = combo.currentData() if combo.currentData() else 'vo'
+
+        def _parse_positive_int(edit_name):
+            edit = dialog.findChild(QLineEdit, edit_name)
+            if not edit:
+                return 0
+            text = edit.text().strip()
+            if not text:
+                return 0
+            try:
+                v = int(float(text))
+                return v if v > 0 else 0
+            except (TypeError, ValueError):
+                return 0
+
+        settings['cache_secs_override'] = _parse_positive_int("cache_secs_override_edit")
+        settings['demuxer_max_bytes_mib_override'] = _parse_positive_int("demuxer_max_bytes_override_edit")
+        settings['demuxer_readahead_secs_override'] = _parse_positive_int("demuxer_readahead_secs_override_edit")
         return settings
 
     def _save_intervals(self, dialog):

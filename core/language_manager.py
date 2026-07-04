@@ -817,6 +817,45 @@ BUILTIN_TRANSLATIONS = {
         'hdr_scrgb': 'scRGB（Windows HDR开启）',
         'hdr_passthrough': 'PQ直通（Windows HDR关闭）',
         'hdr_tonemap': '色调映射到SDR',
+        # 高级播放器参数：视频输出 / 视频同步 / 丢帧策略 / 缓存 override
+        'vo_label': '视频输出 (vo):',
+        'vo_auto': '自动（推荐 - 按 HDR 模式推导）',
+        'vo_gpu': 'gpu（默认跨平台 VO）',
+        'vo_gpu_next': 'gpu-next（新一代，HDR 直通/scRGB）',
+        'vo_libmpv': 'libmpv（Render API，macOS 默认）',
+        'vo_direct3d': 'direct3d（Windows 旧版 VO）',
+        'vo_desc': '选择视频输出后端。"自动" 会按 HDR 模式推导（gpu/gpu-next）。'
+                   'macOS 上 vo 始终被强制为 libmpv（mpv v0.41+ 不再支持 wid 嵌入）。'
+                   'Windows 上 HDR 直通/scRGB 需要 gpu-next。',
+        'video_sync_label': '视频同步 (video-sync):',
+        'vsync_audio': 'audio（默认，按音频时钟同步）',
+        'vsync_display_resample': 'display-resample（重采样音频到显示器）',
+        'vsync_display_tempo': 'display-tempo（按节奏伸缩音频）',
+        'vsync_resample': 'resample（重采样音频，可能漂移）',
+        'vsync_display_desync': 'display-desync（不同步，可能丢帧/重复）',
+        'vsync_desync': 'desync（完全异步）',
+        'video_sync_desc': '音视频同步基准。"audio" 是最安全的默认值。'
+                           '"display-resample"/"display-tempo" 同步到显示器刷新率（更平滑但可能引起音频变调）。',
+        'framedrop_label': '丢帧策略 (framedrop):',
+        'framedrop_vo': 'vo（默认，VO 慢时丢帧）',
+        'framedrop_decoder': 'decoder（解码阶段丢帧，CPU 占用低）',
+        'framedrop_insert': 'insert（按 1:1 插入帧，可能卡顿）',
+        'framedrop_none': 'none（永不丢帧）',
+        'framedrop_never': 'never（none 的别名）',
+        'framedrop_desc': '视频输出落后时的丢帧策略。"vo" 仅在输出阶段丢帧（保持解码质量）。'
+                          '"decoder" 在更早阶段丢帧（弱机器省 CPU）。',
+        'cache_secs_override_label': '缓存秒数 (cache-secs):',
+        'cache_secs_override_placeholder': '0 = 自动（按流类型推导）',
+        'cache_secs_override_desc': '覆盖 demuxer 缓存时长（秒）。留 0 保持自动值'
+                                    '（如直播 3600s、蓝光 180s，按分辨率动态调整）。',
+        'demuxer_max_bytes_override_label': 'Demuxer 最大字节数 (MiB):',
+        'demuxer_max_bytes_override_placeholder': '0 = 自动（MiB，按 cache-secs 推导）',
+        'demuxer_max_bytes_override_desc': '覆盖 demuxer 前向缓存大小（MiB）。留 0 保持自动值'
+                                           '（按 cache-secs 缩放，上限 4096MiB）。',
+        'demuxer_readahead_secs_override_label': 'Demuxer 预读时长 (s):',
+        'demuxer_readahead_secs_override_placeholder': '0 = 自动（按流类型：HLS=120s, TS=300s 等）',
+        'demuxer_readahead_secs_override_desc': '覆盖 demuxer 预读秒数。留 0 保持自动值'
+                                               '（HLS/HTTP=120s, TS=300s, 网络挂载盘=30s 等）。',
         'ctx_hdr_mode': 'HDR 模式',
         'hdr_current_video': '当前视频',
         'osd_hdr_mode': 'HDR 模式',
@@ -1938,6 +1977,46 @@ BUILTIN_TRANSLATIONS = {
         'hdr_scrgb': 'scRGB (Windows HDR ON)',
         'hdr_passthrough': 'PQ Passthrough (Windows HDR OFF)',
         'hdr_tonemap': 'Tone Map to SDR',
+        # Advanced player params: VO / video-sync / framedrop / cache overrides
+        'vo_label': 'Video Output (vo):',
+        'vo_auto': 'Auto (Recommended - derive from HDR mode)',
+        'vo_gpu': 'gpu (Default cross-platform VO)',
+        'vo_gpu_next': 'gpu-next (Next-gen, HDR passthrough/scRGB)',
+        'vo_libmpv': 'libmpv (Render API, macOS default)',
+        'vo_direct3d': 'direct3d (Windows legacy VO)',
+        'vo_desc': 'Selects the video output. "Auto" derives vo from HDR mode (gpu/gpu-next). '
+                   'On macOS, vo is always forced to libmpv (mpv v0.41+ no longer supports wid embedding). '
+                   'gpu-next is required for HDR passthrough/scRGB on Windows.',
+        'video_sync_label': 'Video Sync (video-sync):',
+        'vsync_audio': 'audio (Default, sync to audio clock)',
+        'vsync_display_resample': 'display-resample (Resample audio to display)',
+        'vsync_display_tempo': 'display-tempo (Tempo-scale audio)',
+        'vsync_resample': 'resample (Resample audio, may cause drift)',
+        'vsync_display_desync': 'display-desync (No sync, may drop/dup)',
+        'vsync_desync': 'desync (Completely asynchronous)',
+        'video_sync_desc': 'A/V sync timing reference. "audio" is the safest default. '
+                           '"display-resample"/"display-tempo" sync to display refresh rate (smoother but may pitch-shift audio).',
+        'framedrop_label': 'Framedrop (framedrop):',
+        'framedrop_vo': 'vo (Default, drop when VO is slow)',
+        'framedrop_decoder': 'decoder (Drop at decoder, lower CPU)',
+        'framedrop_insert': 'insert (Insert 1:1 frame, may stutter)',
+        'framedrop_none': 'none (Never drop)',
+        'framedrop_never': 'never (Alias of none)',
+        'framedrop_desc': 'Frame dropping strategy when video output falls behind. '
+                          '"vo" drops only at output stage (keeps decode quality). '
+                          '"decoder" drops earlier (saves CPU on weak machines).',
+        'cache_secs_override_label': 'Cache Seconds (cache-secs):',
+        'cache_secs_override_placeholder': '0 = auto (derived from stream type)',
+        'cache_secs_override_desc': 'Overrides the demuxer cache duration in seconds. Leave 0 to keep '
+                                    'the auto value (e.g. 3600s for live, 180s for Blu-ray, dynamically adjusted by resolution).',
+        'demuxer_max_bytes_override_label': 'Demuxer Max Bytes (MiB):',
+        'demuxer_max_bytes_override_placeholder': '0 = auto (MiB, derived from cache-secs)',
+        'demuxer_max_bytes_override_desc': 'Overrides the demuxer forward cache size in MiB. Leave 0 to keep '
+                                           'the auto value (scales with cache-secs, capped at 4096MiB).',
+        'demuxer_readahead_secs_override_label': 'Demuxer Readahead (s):',
+        'demuxer_readahead_secs_override_placeholder': '0 = auto (per stream type: HLS=120s, TS=300s, ...)',
+        'demuxer_readahead_secs_override_desc': 'Overrides the demuxer readahead in seconds. Leave 0 to keep '
+                                               'the auto value (120s for HLS/HTTP, 300s for TS, 30s for network drives, etc.).',
         'ctx_hdr_mode': 'HDR Mode',
         'hdr_current_video': 'Current',
         'osd_hdr_mode': 'HDR Mode',

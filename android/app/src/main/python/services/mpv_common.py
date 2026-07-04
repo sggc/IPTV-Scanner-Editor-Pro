@@ -614,11 +614,16 @@ def render_context_create(mpv_handle):
     if not libmpv or not mpv_handle:
         return None
     try:
-        params = [
+        # 注意：必须显式构造 ctypes 数组，不能直接传 Python list。
+        # Windows Python 的 ctypes 对 list -> POINTER(struct) 做了隐式转换，
+        # 但 macOS Python 严格检查类型，传 list 会抛
+        # "expected LP_mpv_render_param instance instead of list"，
+        # 导致 render context 创建失败、画面黑屏（仅有声）。
+        params = (mpv_render_param * 2)(
             mpv_render_param(MPV_RENDER_PARAM_API_TYPE,
                              ctypes.cast(ctypes.c_char_p(MPV_RENDER_API_TYPE_OPENGL), ctypes.c_void_p)),
             mpv_render_param(MPV_RENDER_PARAM_INVALID, ctypes.c_void_p(0)),
-        ]
+        )
         ctx = ctypes.c_void_p()
         ret = libmpv.mpv_render_context_create(ctypes.byref(ctx), mpv_handle, params)
         if ret < 0:
@@ -637,7 +642,11 @@ def render_context_render(render_ctx, fbo, width, height, flip_y=False):
         gl_fbo = mpv_opengl_fbo(fbo=fbo, w=width, h=height, internal_format=0)
         flip = ctypes.c_int(1 if flip_y else 0)
         block = ctypes.c_int(1)
-        params = [
+        # 同 render_context_create：必须用 ctypes 数组而非 list，
+        # 否则 macOS Python 会因类型严格检查抛 TypeError。
+        # gl_fbo / flip / block 必须保留在栈上直到 render 调用返回，
+        # 因为 ctypes 数组只是引用了它们的 byref 指针。
+        params = (mpv_render_param * 4)(
             mpv_render_param(MPV_RENDER_PARAM_OPENGL_FBO,
                              ctypes.cast(ctypes.byref(gl_fbo), ctypes.c_void_p)),
             mpv_render_param(MPV_RENDER_PARAM_FLIP_Y,
@@ -645,7 +654,7 @@ def render_context_render(render_ctx, fbo, width, height, flip_y=False):
             mpv_render_param(MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
                              ctypes.cast(ctypes.byref(block), ctypes.c_void_p)),
             mpv_render_param(MPV_RENDER_PARAM_INVALID, ctypes.c_void_p(0)),
-        ]
+        )
         return libmpv.mpv_render_context_render(render_ctx, params)
     except Exception as e:
         logger.error(f"mpv_render_context_render异常: {e}")
