@@ -394,8 +394,10 @@ jobs:
             -Ddemos=false
           meson compile -C build_dir
           meson install -C build_dir
+          # 注意：$GITHUB_ENV 设置的环境变量只在后续步骤生效，当前步骤需要 export
+          export PKG_CONFIG_PATH="$HOME/libplacebo-install/lib/pkgconfig:$PKG_CONFIG_PATH"
           pkg-config --modversion libplacebo
-          echo "PKG_CONFIG_PATH=$HOME/libplacebo-install/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
       - name: Build mpv
         run: |
@@ -612,8 +614,10 @@ jobs:
             -Ddemos=false
           meson compile -C build_dir
           meson install -C build_dir
+          # 注意：$GITHUB_ENV 设置的环境变量只在后续步骤生效，当前步骤需要 export
+          export PKG_CONFIG_PATH="$HOME/libplacebo-install/lib/pkgconfig:$PKG_CONFIG_PATH"
           pkg-config --modversion libplacebo
-          echo "PKG_CONFIG_PATH=$HOME/libplacebo-install/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
       - name: Build mpv
         run: |
