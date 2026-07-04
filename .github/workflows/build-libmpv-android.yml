@@ -166,8 +166,15 @@ jobs:
           	--disable-static \
           	--enable-pic \
           	--disable-asm
-          make -j$cores
-          make DESTDIR="$prefix_dir" install
+          # 根因修复：davs2 configure 默认开启 cli，会在 config.mak 中写入
+          # `default: cli` 和 `install: install-cli`，导致 `make` 和 `make install`
+          # 都会构建 test/test.c 的可执行文件 davs2$(EXE)。该 test 二进制调用
+          # __android_log_print 需要 -llog，但 configure 生成的 Makefile 未添加此库，
+          # 导致链接失败：ld.lld: error: undefined symbol: __android_log_print
+          # 我们只需要 libdavs2.so 共享库，不需要 test 可执行文件，因此显式指定
+          # lib-shared 目标构建共享库，install-lib-shared 目标安装共享库+头文件+.pc。
+          make -j$cores lib-shared
+          make DESTDIR="$prefix_dir" install-lib-shared
           DAVS2_EOF
           chmod +x scripts/davs2.sh
           echo "=== Created scripts/davs2.sh ==="
