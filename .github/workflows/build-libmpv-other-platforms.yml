@@ -59,7 +59,7 @@ jobs:
         # 构建 AVS2 外部解码器库 (pkuvcl/davs2)
         run: |
           cd build/davs2
-          git clone --depth 1 --branch v1.8.1 https://github.com/pkuvcl/davs2.git .
+          git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git .
           cd build/linux
           ./configure --prefix="$HOME/davs2-install" --enable-shared --disable-static
           make -j$(sysctl -n hw.ncpu)
@@ -234,7 +234,7 @@ jobs:
       - name: Build libdavs2 (AVS2 decoder)
         run: |
           cd build/davs2
-          git clone --depth 1 --branch v1.8.1 https://github.com/pkuvcl/davs2.git .
+          git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git .
           cd build/linux
           ./configure --prefix="$HOME/davs2-install" --enable-shared --disable-static
           make -j$(nproc)
@@ -393,7 +393,7 @@ jobs:
       - name: Build libdavs2 (AVS2 decoder)
         run: |
           cd build/davs2
-          git clone --depth 1 --branch v1.8.1 https://github.com/pkuvcl/davs2.git .
+          git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git .
           cd build/linux
           ./configure --prefix="$HOME/davs2-install" --enable-shared --disable-static
           make -j$(nproc)

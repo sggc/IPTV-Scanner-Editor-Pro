@@ -367,8 +367,8 @@ jobs:
         run: yes | sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Download CAVS-enabled libmpv for Android
-        # 优先从项目 Release 下载带 CAVS 支持的 libmpv .so 文件
-        # 如果 Release 不存在，fallback 到官方 mpv-android APK（无 CAVS 支持）
+        # 优先从项目 Release 下载带 CAVS + AVS2 支持的 libmpv .so 文件
+        # 如果 Release 不存在，fallback 到官方 mpv-android APK（无 CAVS/AVS2 支持）
         working-directory: android
         run: |
           JNILIBS_DIR="app/src/main/jniLibs"

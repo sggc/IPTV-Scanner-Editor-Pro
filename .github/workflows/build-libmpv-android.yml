@@ -5,14 +5,16 @@ name: Build libmpv with CAVS support (Android)
 # 产物上传到 GitHub Release，供 build.yml 下载使用
 #
 # CAVS (AVS1-P16, 广电 profile) 通过 patch 修改内置 cavs 解码器实现
-# 注意：mpv-android 默认不启用 libdavs2，因此 Android 端无 AVS2 外部解码器
-#       但 CAVS 解码器是内置实现，不依赖外部库
+# AVS2 (4K) 通过 libdavs2 外部库实现（--enable-libdavs2）
+# 两者并存，不丢失任何其他解码器
 #
 # 构建方式：
 # 1. 克隆 mpv-android 仓库
-# 2. 修改 buildscripts/include/download-deps.sh，在 FFmpeg clone 后应用 CAVS patch
-# 3. 运行 buildscripts/buildall.sh 构建各 ABI 的 libmpv
-# 4. 提取 libmpv.so 文件打包
+# 2. 修改 buildscripts：添加 davs2 依赖声明、下载逻辑、构建脚本，FFmpeg 启用 libdavs2
+# 3. 运行 buildscripts/download.sh 下载所有依赖（含 davs2 源码）
+# 4. 在 FFmpeg 源码上手动应用 CAVS patch
+# 5. 运行 buildscripts/buildall.sh 构建各 ABI 的 libmpv
+# 6. 提取 libmpv.so 文件打包
 
 on:
   workflow_dispatch:
@@ -101,16 +103,91 @@ jobs:
           done
           ls -la cavs_patches/
 
-      - name: Download dependencies
-        # 运行 download.sh 下载所有依赖（包括 FFmpeg 源码）
+      - name: Add libdavs2 support for AVS2 decoding
+        # 修改 mpv-android buildscripts，集成 libdavs2 (AVS2 解码器)：
+        # 1. include/depinfo.sh：声明 v_davs2 版本、dep_davs2 空依赖、把 davs2 加入 dep_ffmpeg
+        # 2. include/download-deps.sh：添加 davs2 源码下载逻辑（git clone 1.7）
+        # 3. scripts/davs2.sh：autotools 交叉编译脚本（--host=$ndk_triple, DESTDIR=$prefix_dir）
+        # 4. scripts/ffmpeg.sh：在 --enable-{...} 中追加 libdavs2
+        # 这样 buildall.sh 会按依赖树自动构建 davs2，再构建 FFmpeg（含 libdavs2）
+        #
+        # 注意：pkuvcl/davs2 仓库最新 tag 是 1.7（无 v1.8.1，无 release）
+        # davs2 是 C++ 项目，默认用 g++，但 Android NDK 只有 clang++，需用 CXX 覆盖
+        # davs2 的 configure 不支持 CC=... 命令行赋值，需通过环境变量 export CC
         run: |
           cd mpv-android/buildscripts
-          # 设置 IN_CI=1 使用稳定的 release 版本（n8.1.2）
+
+          # 1. 修改 depinfo.sh：添加 davs2 版本、依赖声明
+          #    v_davs2 紧跟在 v_libxml2 后面（版本号区）
+          sed -i '/^v_libxml2=/a v_davs2=1.7' include/depinfo.sh
+          #    dep_davs2=() 紧跟在 dep_dav1d=() 后面（依赖树区）
+          sed -i '/^dep_dav1d=/a dep_davs2=()' include/depinfo.sh
+          #    把 davs2 加入 FFmpeg 的依赖列表
+          sed -i 's/dep_ffmpeg=(mbedtls dav1d libxml2)/dep_ffmpeg=(mbedtls dav1d libxml2 davs2)/' include/depinfo.sh
+          echo "=== Patched depinfo.sh (davs2 entries) ==="
+          grep -E "davs2|dep_ffmpeg=" include/depinfo.sh
+
+          # 2. 修改 download-deps.sh：在 dav1d 下载逻辑后添加 davs2 下载逻辑
+          #    使用 git clone --depth 1 --branch 1.7 拉取 pkuvcl/davs2
+          #    注意：sed 中 && 需转义为 \&\&
+          sed -i '/^\[ ! -d dav1d \] && git clone https:\/\/github.com\/videolan\/dav1d$/a # davs2\n[ ! -d davs2 ] \&\& git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git' include/download-deps.sh
+          echo "=== Patched download-deps.sh (davs2 section) ==="
+          grep -A2 -B1 "davs2" include/download-deps.sh
+
+          # 3. 创建 scripts/davs2.sh：autotools 交叉编译
+          #    - configure 在 build/linux/ 子目录中（davs2 项目结构特殊）
+          #    - davs2 默认用 g++，但 NDK 只有 clang++，所以 export CC=$CXX
+          #    - --host=$ndk_triple 触发交叉编译
+          #    - --prefix=/ + DESTDIR=$prefix_dir 安装到 staging 目录
+          #    - --disable-asm 避免 armv7/x86 上的汇编兼容问题
+          #    - --enable-pic 生成位置无关代码（动态库所需）
+          cat > scripts/davs2.sh <<'DAVS2_EOF'
+          #!/bin/bash -e
+          . ../../include/path.sh
+          if [ "$1" == "build" ]; then
+          	true
+          elif [ "$1" == "clean" ]; then
+          	rm -rf _build$ndk_suffix
+          	exit 0
+          else
+          	exit 255
+          fi
+          # davs2 是 C++ 项目（默认用 g++），NDK 只有 clang++，用 CXX 覆盖
+          export CC="$CXX"
+          cd build/linux
+          ./configure \
+          	--host=$ndk_triple \
+          	--prefix=/ \
+          	--enable-shared \
+          	--disable-static \
+          	--enable-pic \
+          	--disable-asm
+          make -j$cores
+          make DESTDIR="$prefix_dir" install
+          DAVS2_EOF
+          chmod +x scripts/davs2.sh
+          echo "=== Created scripts/davs2.sh ==="
+          cat scripts/davs2.sh
+
+          # 4. 修改 scripts/ffmpeg.sh：在 --enable-{...} 中追加 libdavs2
+          #    bash brace expansion 会展开为 --enable-libdavs2
+          sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
+          echo "=== Patched ffmpeg.sh (libdavs2 enabled) ==="
+          grep "enable-" scripts/ffmpeg.sh
+
+      - name: Download dependencies
+        # 运行 download.sh 下载所有依赖（包括 FFmpeg 和 davs2 源码）
+        run: |
+          cd mpv-android/buildscripts
+          # 设置 IN_CI=1 使用稳定的 release 版本（n8.0.1）
           export IN_CI=1
           ./download.sh
           echo "=== FFmpeg source location ==="
           find . -type d -name "ffmpeg" | grep -v ".git" | head -5
-          ls -la deps/ 2>/dev/null || ls -la sources/ 2>/dev/null || true
+          echo "=== davs2 source location ==="
+          ls -la deps/davs2/ 2>/dev/null || { echo "ERROR: davs2 source not downloaded"; exit 1; }
+          ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 configure script not found"; exit 1; }
+          ls -la deps/ 2>/dev/null || true
 
       - name: Apply CAVS patches to FFmpeg
         # 在 download.sh 下载 FFmpeg 后，手动应用 CAVS patch
@@ -192,14 +269,17 @@ jobs:
           find . -name "libswscale.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
           find . -name "libswresample.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
           find . -name "libdav1d.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+          # 收集 libdavs2.so（AVS2 解码器）
+          find . -name "libdavs2.so*" -path "*/install_dir/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+          find . -name "libdavs2.so*" -path "*/prefix/*" -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
 
           echo "=== Collected artifacts ==="
           ls -la "$ARTIFACT_DIR/"
 
-          # 验证 CAVS 支持
-          echo "=== Checking cavs strings in libmpv.so ==="
-          strings "$ARTIFACT_DIR/libmpv.so" | grep -iE "guangdian|jizhun|cavs" | head -10 || \
-            echo "WARNING: Could not find CAVS strings in libmpv.so"
+          # 验证 CAVS 和 AVS2 支持
+          echo "=== Checking cavs/avs2 strings in libmpv.so ==="
+          strings "$ARTIFACT_DIR/libmpv.so" | grep -iE "guangdian|jizhun|cavs|avs2|libdavs2" | head -20 || \
+            echo "WARNING: Could not find CAVS/AVS2 strings in libmpv.so"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
