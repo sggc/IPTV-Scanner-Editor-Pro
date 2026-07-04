@@ -55,52 +55,51 @@ jobs:
 
       - name: Patch sources for CAVS and shaderc support
         # 修补 mpv-winbuild-cmake 的源码配置：
-        # 1. FFmpeg：使用 sumingyd/FFmpeg fork（fork 自 llawsxx/FFmpeg）
-        #    包含 CAVS Guangdian profile (AVS1-P16) 解码支持
-        #    修改方式：用 libcavs.c + libcavsdec.c 替换原 cavsdec.c（内部实现，无需外部库）
-        # 2. 禁用 libdavs2 和 NVENC：sumingyd/FFmpeg fork 与 mpv-winbuild-cmake 的依赖版本不兼容
-        #    - libdavs2: AVS2 解码器结构体成员缺失
-        #    - NVENC: nvcodec-headers 中 NV_ENC_CLOCK_TIMESTAMP_SET.countingType 不存在
-        #    CAVS (AVS1) 不依赖这两者，禁用不影响 CAVS Guangdian profile 支持
+        # 1. FFmpeg：使用官方 FFmpeg，然后应用 llawsxx/FFmpeg 的 CAVS Guangdian profile 补丁
+        #    只添加 CAVS (AVS1-P16, Guangdian profile) 解码支持，保留所有其他解码器
+        #    (包括 AVS2/libdavs2、AVS3、H.264、H.265 等)
+        #    补丁来源：llawsxx/FFmpeg 的 6 个 CAVS 相关 commits
+        #    - 新增 6 个文件: libcavs.c libcavs.h libcavsdec.c dradec.c dradec.h libdradec.c
+        #    - 修改 6 个配置文件: configure Makefile allcodecs.c codec_desc.c codec_id.h mpegts.c
+        # 2. 禁用 NVENC：nvcodec-headers 中 NV_ENC_CLOCK_TIMESTAMP_SET.countingType 不存在
+        #    CAVS 不依赖 NVENC，禁用不影响 CAVS 支持
+        #    注意：仅将 ffmpeg_cuda 设为空字符串不够，FFmpeg configure 检测到
+        #    nvcodec-headers 后会自动启用 nvenc，必须显式 --disable-nvenc
         # 3. 禁用 libbluray：libbluray 和 libdvdread 都包含相同的 file_dir_win32.c
         #    和 file_file_win32.c 源文件，导致 dir_open_default 和 file_open_default
         #    符号多重定义链接错误。蓝光播放对 IPTV 应用不需要，禁用不影响 CAVS 支持
+        #    注意：必须同时禁用 FFmpeg 和 mpv 的 libbluray，因为两者都默认启用：
+        #    - FFmpeg: --enable-libbluray (packages/ffmpeg.cmake)
+        #    - mpv: -Dlibbluray=enabled (packages/mpv.cmake)
+        #    只禁用 FFmpeg 不够，mpv 仍会通过 pkg-config 找到 libbluray.a 并链接
         # 4. shaderc 依赖：固定 spirv-headers、spirv-tools、glslang 到兼容版本
         run: |
           cd mpv-winbuild-cmake
-          # 1. 替换 FFmpeg 仓库为 sumingyd/FFmpeg fork
-          sed -i 's|https://github.com/FFmpeg/FFmpeg.git|https://github.com/sumingyd/FFmpeg.git|' packages/ffmpeg.cmake
-          # 2. 禁用 libdavs2 (AVS2 解码器) 和 NVENC (NVIDIA 硬件编码器)
-          #    sumingyd/FFmpeg fork 与 mpv-winbuild-cmake 构建的依赖版本不兼容：
-          #    - libdavs2: 结构体成员缺失
-          #    - NVENC: nvcodec-headers 版本中 NV_ENC_CLOCK_TIMESTAMP_SET.countingType 不存在
-          #    CAVS (AVS1) 不依赖这两者，禁用不影响 CAVS Guangdian profile 支持
-          #    注意：仅将 ffmpeg_cuda 设为空字符串不够，FFmpeg configure 检测到
-          #    nvcodec-headers 后会自动启用 nvenc，必须显式 --disable-nvenc
-          sed -i 's|set(ffmpeg_davs2_cmd "--enable-libdavs2")|set(ffmpeg_davs2_cmd "")|' cmake/packages_check.cmake
+          # 1. CAVS 补丁：修改 ffmpeg.cmake 添加 PATCH_COMMAND
+          #    真正的 patch 文件在 Building mpv 步骤中下载并放到 src_packages/cavs_patches
+          #    PATCH_COMMAND 在 SOURCE_DIR (src_packages/ffmpeg) 中执行
+          #    所以用 ../cavs_patches/ 引用 patch 文件
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          CAVS_PATCH_CMD=""
+          for sha in $CAVS_PATCHES; do
+            CAVS_PATCH_CMD="${CAVS_PATCH_CMD} && patch -p1 -i ../cavs_patches/${sha}.patch"
+          done
+          CAVS_PATCH_CMD="${CAVS_PATCH_CMD# && }"
+          sed -i "/UPDATE_COMMAND \"\"/a\\    PATCH_COMMAND bash -c \"${CAVS_PATCH_CMD}\"" packages/ffmpeg.cmake
+          echo "=== Patched ffmpeg.cmake (CAVS patches injection) ==="
+          grep -A2 "PATCH_COMMAND" packages/ffmpeg.cmake
+          # 2. 禁用 NVENC (NVIDIA 硬件编码器)
           sed -i 's|set(ffmpeg_cuda "--enable-cuda-llvm --enable-cuvid --enable-nvdec --enable-nvenc")|set(ffmpeg_cuda "--disable-cuda-llvm --disable-cuvid --disable-nvdec --disable-nvenc")|' cmake/packages_check.cmake
           # 3. 禁用 libbluray 解决与 libdvdread 的符号冲突
-          #    libbluray.a 和 libdvdread.a 都编译了 file_dir_win32.c 和 file_file_win32.c
-          #    导致 dir_open_default 和 file_open_default 多重定义
-          #    蓝光播放对 IPTV 应用不需要，禁用不影响 CAVS Guangdian profile 支持
-          #    注意：必须同时禁用 FFmpeg 和 mpv 的 libbluray，因为两者都默认启用：
-          #    - FFmpeg: --enable-libbluray (packages/ffmpeg.cmake)
-          #    - mpv: -Dlibbluray=enabled (packages/mpv.cmake)
-          #    只禁用 FFmpeg 不够，mpv 仍会通过 pkg-config 找到 libbluray.a 并链接
           sed -i 's|--enable-libbluray|--disable-libbluray|' packages/ffmpeg.cmake
           sed -i 's|-Dlibbluray=enabled|-Dlibbluray=disabled|' packages/mpv.cmake
-          echo "=== Patched ffmpeg.cmake (GIT_REPOSITORY, libbluray) ==="
-          grep -E "GIT_REPOSITORY|libbluray" packages/ffmpeg.cmake
+          echo "=== Patched ffmpeg.cmake (libbluray) ==="
+          grep -E "libbluray" packages/ffmpeg.cmake
           echo "=== Patched mpv.cmake (libbluray) ==="
           grep -E "libbluray" packages/mpv.cmake
-          echo "=== Patched packages_check.cmake (ffmpeg_davs2_cmd, ffmpeg_cuda) ==="
-          grep -E "ffmpeg_davs2_cmd|ffmpeg_cuda" cmake/packages_check.cmake
+          echo "=== Patched packages_check.cmake (ffmpeg_cuda) ==="
+          grep -E "ffmpeg_cuda" cmake/packages_check.cmake
           # 4. 固定 spirv-headers、spirv-tools、glslang 到 shaderc DEPS 文件声明的兼容版本
-          #    原因：这三个包各自跟踪 main 分支，但 main 分支版本可能不兼容
-          #    导致 spirv-tools 编译时 SPV_OPERAND_TYPE_GATHER_MODES 未定义错误
-          #    shaderc 项目的 DEPS 文件声明了配套的 commit hash
-          #    同时设置 _EP_GIT_RESET 属性，让 force_rebuild_git 用 commit hash 作为 reset 目标
-          #    否则 force_rebuild_git 会用 @{u} 重置，detached HEAD 时 git rev-parse @{u} 失败
           sed -i 's|GIT_TAG main|GIT_TAG daa093dd29aab8cbb6562b808370562f56e399fb|' packages/spirv-headers.cmake
           sed -i '/force_rebuild_git(spirv-headers)/i set_property(TARGET spirv-headers PROPERTY _EP_GIT_RESET "daa093dd29aab8cbb6562b808370562f56e399fb")' packages/spirv-headers.cmake
           sed -i 's|GIT_TAG main|GIT_TAG d5bbf95d87dd6d2694fbf09acfb42a00c93575e8|' packages/spirv-tools.cmake
@@ -207,6 +206,7 @@ jobs:
           # 删除 FFmpeg 和 mpv 的 configure/build stamp 文件，强制重新 configure
           # 原因：修改了 configure 选项（FFmpeg 禁用 libbluray，mpv 禁用 libbluray）
           # 如果不删除 stamp 文件，ninja 会跳过 configure，使用旧的配置结果
+          rm -f build_x86_64/packages/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-patch
           rm -f build_x86_64/packages/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-configure
           rm -f build_x86_64/packages/ffmpeg-prefix/src/ffmpeg-stamp/ffmpeg-build
           rm -f build_x86_64/packages/mpv-prefix/src/mpv-stamp/mpv-configure
@@ -220,6 +220,19 @@ jobs:
           rm -f build_x86_64/packages/spirv-tools-prefix/src/spirv-tools-stamp/HEAD
           rm -f build_x86_64/packages/glslang-prefix/src/glslang-stamp/HEAD
           ninja -C build_x86_64 update
+          # 在 ninja 构建前下载 CAVS patches 到 src_packages/cavs_patches
+          # PATCH_COMMAND 在 SOURCE_DIR (src_packages/ffmpeg) 中执行，用 ../cavs_patches/ 引用
+          CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
+          mkdir -p src_packages/cavs_patches
+          for sha in $CAVS_PATCHES; do
+            if [ ! -f "src_packages/cavs_patches/${sha}.patch" ]; then
+              echo "Downloading CAVS patch $sha..."
+              curl -fsSL "https://github.com/llawsxx/FFmpeg/commit/${sha}.patch" \
+                -o "src_packages/cavs_patches/${sha}.patch" || { echo "Failed to download patch $sha"; exit 1; }
+            fi
+          done
+          echo "=== CAVS patches ==="
+          ls -la src_packages/cavs_patches/
           ninja -C build_x86_64 mpv || {
             echo "=== mpv build failed! Diagnostics below ==="
             echo "=== All package build logs (last 200 lines each) ==="
