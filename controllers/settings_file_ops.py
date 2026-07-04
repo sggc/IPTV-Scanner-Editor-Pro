@@ -1030,7 +1030,7 @@ class SettingsFileOperations:
 
     def _open_stream(self):
         """打开串流地址"""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QHBoxLayout, QPushButton
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QHBoxLayout, QPushButton, QCheckBox
         from ui.floating_dialog import FloatingDialog
         from ui.styles import AppStyles
         from ui.theme_manager import get_theme_manager
@@ -1062,6 +1062,14 @@ class SettingsFileOperations:
         name_input.setMinimumHeight(32)
         layout.addWidget(name_input)
 
+        # "作为 M3U 列表解析"复选框
+        # 用户可主动选择是否将输入的 URL 作为 M3U 列表解析
+        # 不勾选时，系统自动判断（下载内容后根据 #EXTM3U 等标记判断）
+        parse_as_playlist_checkbox = QCheckBox(
+            tr("parse_as_playlist", "作为 M3U 列表解析（不勾选则自动判断）")
+        )
+        layout.addWidget(parse_as_playlist_checkbox)
+
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         cancel_btn = QPushButton(tr("cancel", "取消"))
@@ -1085,15 +1093,24 @@ class SettingsFileOperations:
         if dialog.exec() == QDialog.DialogCode.Accepted:
             url = url_input.text().strip()
             if url:
-                self._open_stream_by_content(url, name_input.text().strip())
+                self._open_stream_by_content(
+                    url, name_input.text().strip(),
+                    force_as_playlist=parse_as_playlist_checkbox.isChecked()
+                )
                 w.config.add_recent_file(url)
                 w.update_recent_files_menu()
             tm.unregister_window(dialog)
         else:
             tm.unregister_window(dialog)
 
-    def _open_stream_by_content(self, url: str, custom_name: str = ''):
-        """根据URL内容自动判断是M3U列表还是单个串流"""
+    def _open_stream_by_content(self, url: str, custom_name: str = '', force_as_playlist: bool = False):
+        """根据URL内容自动判断是M3U列表还是单个串流
+
+        Args:
+            force_as_playlist: 强制作为 M3U 列表解析。
+                True: 强制按 M3U 列表解析，下载失败则提示用户，不回退到单流。
+                False: 自动判断（默认行为）。
+        """
         from core.log_manager import global_logger as logger
         from services.m3u_parser import parse_m3u_content, load_m3u_from_url_data
         from urllib.parse import urlparse
@@ -1103,7 +1120,7 @@ class SettingsFileOperations:
         path_lower = urlparse(url).path.lower()
         maybe_m3u = path_lower.endswith(('.m3u', '.m3u8', '.txt'))
 
-        if maybe_m3u:
+        if maybe_m3u or force_as_playlist:
             content = ''
             try:
                 import requests
@@ -1126,7 +1143,16 @@ class SettingsFileOperations:
                 logger.error(f"下载M3U列表失败: {e}")
                 if hasattr(w, 'status_bar_show_message'):
                     w.status_bar_show_message(tr("m3u_download_failed", "M3U列表下载失败"))
-                # 回退到作为单频道串流处理（不 return）
+                # 强制作为列表解析时，下载失败则提示用户，不回退到单流
+                if force_as_playlist:
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        w, tr("open_stream", "打开串流"),
+                        tr("m3u_download_failed_prompt",
+                           "无法下载列表内容：\n{error}\n\n请检查网络或地址是否正确。").format(error=str(e))
+                    )
+                    return
+                # 否则回退到作为单频道串流处理（不 return）
                 # 某些 m3u8 服务器会拒绝 requests 下载（UA/token 校验），
                 # 但 mpv 内部使用自己的 HTTP 客户端可以正常播放，
                 # 因此下载失败时不应阻止直接交给 mpv 播放。
@@ -1136,7 +1162,18 @@ class SettingsFileOperations:
                 # 注意：#EXTINF 不能作为 HLS 判断依据，因为普通 M3U 频道列表也包含 #EXTINF
                 is_hls = '#EXT-X-STREAM-INF' in content or '#EXT-X-TARGETDURATION' in content
                 if is_hls:
-                    logger.info("检测到HLS Playlist，作为单频道串流处理")
+                    # HLS 单流（主播放列表或媒体播放列表），作为单频道处理
+                    if force_as_playlist:
+                        # 用户强制作为列表解析，但实际是 HLS 单流，提示用户
+                        logger.info("检测到HLS Playlist，用户强制作为列表解析，提示用户并作为单流添加")
+                        from PySide6.QtWidgets import QMessageBox
+                        QMessageBox.information(
+                            w, tr("open_stream", "打开串流"),
+                            tr("hls_not_playlist_prompt",
+                               "检测到这是 HLS 单流，不是 M3U 频道列表。\n已作为单流添加到本地列表。")
+                        )
+                    else:
+                        logger.info("检测到HLS Playlist，作为单频道串流处理")
                     name = custom_name
                     if not name:
                         name = url.split('/')[-1][:30] if '/' in url else url[:30]
