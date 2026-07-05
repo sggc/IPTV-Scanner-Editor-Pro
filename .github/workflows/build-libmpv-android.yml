@@ -1,16 +1,17 @@
-name: Build libmpv with CAVS/AVS2 support (Android, static, stripped, optimized)
+name: Build libmpv with CAVS/AVS2 support (Android, dynamic, stripped, optimized)
 
 # Build libmpv for Android with CAVS (Guangdian) + AVS2 support
-# Optimized: static linked + decoder stripped + size optimized + llvm-strip
-# Output: single libmpv.so per arch
+# Dynamic linking (compatible with libplayer.so from Maven)
+# Optimized: decoder stripped + size optimized + llvm-strip
+# Output: libmpv.so + FFmpeg .so + libdavs2.so per arch
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag (e.g. libmpv-cavs-static-latest)"
+        description: "Release tag (e.g. libmpv-cavs-dynamic-latest)"
         required: true
-        default: "libmpv-cavs-static-latest"
+        default: "libmpv-cavs-dynamic-latest"
 
 permissions:
   contents: write
@@ -92,7 +93,7 @@ jobs:
           # === 2. download-deps.sh: add davs2 download ===
           sed -i '/^\[ ! -d dav1d \] && git clone https:\/\/github.com\/videolan\/dav1d$/a # davs2\n[ ! -d davs2 ] \&\& git clone --depth 1 --branch 1.7 https:\/\/github.com\/pkuvcl\/davs2.git' include/download-deps.sh
 
-          # === 3. Create scripts/davs2.sh (static build) ===
+          # === 3. Create scripts/davs2.sh (dynamic build) ===
           cat > scripts/davs2.sh << 'DAVS2EOF'
           #!/bin/bash -e
           . ../../include/path.sh
@@ -110,23 +111,19 @@ jobs:
           ./configure \
           	--host=$ndk_triple \
           	--prefix=/ \
-          	--disable-shared \
-          	--enable-static \
+          	--enable-shared \
+          	--disable-static \
           	--enable-pic \
           	--disable-asm
-          make -j$cores lib-static
-          make DESTDIR="$prefix_dir" install-lib-static
+          make -j$cores lib-shared
+          make DESTDIR="$prefix_dir" install-lib-shared
           DAVS2EOF
           chmod +x scripts/davs2.sh
 
           # === 4. Patch ffmpeg.sh ===
           # 4a. Enable libdavs2
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
-          # 4b. Shared -> static
-          sed -i 's/--disable-static --enable-shared/--enable-static --disable-shared/' scripts/ffmpeg.sh
-          # 4c. Add --ar, --ranlib, and size optimization flags for FFmpeg
-          # Note: only add options that this FFmpeg version recognizes.
-          # mpv-android buildscripts already disable programs/doc/debug/etc.
+          # 4b. Add size optimization flags (keep dynamic linking, no static changes)
           sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os/' scripts/ffmpeg.sh
           # 4c. Decoder stripping: write block to temp file then insert with sed r
           cat > /tmp/decoders.txt << 'DECEOF'
@@ -154,27 +151,6 @@ jobs:
           sed -i '/--disable-{muxers,encoders,devices}/r /tmp/decoders.txt' scripts/ffmpeg.sh
           echo "=== ffmpeg.sh ==="
           grep -c "enable-decoder" scripts/ffmpeg.sh
-
-          # === 5. Patch mpv.sh: static linking prep ===
-          # Write prep script to temp file
-          cat > /tmp/mpv_prep.sh << 'PREPEOF'
-          # Create pkg-config --static wrapper
-          cat > "$prefix_dir/pkg-config-static" << 'PCW'
-          #!/bin/bash
-          exec pkg-config --static "$@"
-          PCW
-          chmod +x "$prefix_dir/pkg-config-static"
-          sed -i "s|pkgconfig = 'pkg-config'|pkgconfig = '$prefix_dir/pkg-config-static'|" "$prefix_dir/crossfile.txt"
-          sed -i "s|pkg-config = 'pkg-config'|pkg-config = '$prefix_dir/pkg-config-static'|" "$prefix_dir/crossfile.txt"
-          # Remove all .so files to force static linking
-          find "$prefix_dir/lib" \( -name "*.so" -o -name "*.so.*" \) -delete 2>/dev/null || true
-          echo "=== static prep done, .a files: ==="
-          find "$prefix_dir/lib" -name "*.a" | wc -l
-          PREPEOF
-          # Insert "source /tmp/mpv_prep.sh" before "unset CC CXX" in mpv.sh
-          sed -i '/^unset CC CXX/i\source /tmp/mpv_prep.sh' scripts/mpv.sh
-          echo "=== mpv.sh ==="
-          head -10 scripts/mpv.sh
 
       - name: Download dependencies
         run: |
@@ -219,36 +195,58 @@ jobs:
           cd mpv-android/buildscripts
           export IN_CI=1
           ./buildall.sh --arch ${{ matrix.arch.buildall_arg }} mpv
-          find . -name "libmpv.so" -ls 2>/dev/null || true
+          find . -name "*.so" -ls 2>/dev/null || true
 
-      - name: Collect libmpv.so
+      - name: Collect and strip all .so files
         run: |
           cd mpv-android/buildscripts
           mkdir -p "artifacts/${{ matrix.arch.name }}"
-          MPV_SO=$(find . -name "libmpv.so" -type f | head -1)
-          if [ -z "$MPV_SO" ]; then
-            echo "ERROR: libmpv.so not found"
+          STRIP_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          
+          # Find the prefix lib directory with all .so files
+          PREFIX_LIB=""
+          for d in "prefix/${{ matrix.arch.buildall_arg }}/lib" "prefix/arm64/lib" "prefix/armv7l/lib"; do
+            if [ -d "$d" ] && ls "$d"/*.so 1>/dev/null 2>&1; then
+              PREFIX_LIB="$d"
+              break
+            fi
+          done
+          
+          if [ -z "$PREFIX_LIB" ]; then
+            echo "ERROR: no .so files found in prefix"
             find . -name "*.so" -ls | head -30
             exit 1
           fi
-          echo "=== Size before strip ==="
-          ls -lh "$MPV_SO"
-          # Strip debug symbols using NDK llvm-strip (biggest size reduction)
-          STRIP_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          if [ -f "$STRIP_TOOL" ]; then
-            "$STRIP_TOOL" --strip-all "$MPV_SO"
-            echo "=== Size after strip ==="
-            ls -lh "$MPV_SO"
+          
+          echo "=== Collecting .so from $PREFIX_LIB ==="
+          for so in "$PREFIX_LIB"/*.so; do
+            [ -f "$so" ] || continue
+            base=$(basename "$so")
+            echo "--- $base ---"
+            echo "Before strip: $(ls -lh "$so" | awk '{print $5}')"
+            if [ -f "$STRIP_TOOL" ]; then
+              "$STRIP_TOOL" --strip-all "$so" 2>/dev/null || true
+              echo "After strip:  $(ls -lh "$so" | awk '{print $5}')"
+            fi
+            cp -L "$so" "artifacts/${{ matrix.arch.name }}/"
+          done
+          
+          # Also check for libdavs2.so in prefix
+          if [ -f "$PREFIX_LIB/libdavs2.so" ]; then
+            echo "libdavs2.so collected"
           else
-            echo "WARNING: llvm-strip not found at $STRIP_TOOL, skipping strip"
+            echo "WARNING: libdavs2.so not found in $PREFIX_LIB"
+            find . -name "libdavs2.so" -ls 2>/dev/null || true
           fi
-          cp -L "$MPV_SO" "artifacts/${{ matrix.arch.name }}/"
-          echo "=== Final size ==="
-          ls -lh "artifacts/${{ matrix.arch.name }}/libmpv.so"
+          
+          echo "=== Final artifacts ==="
+          ls -lh "artifacts/${{ matrix.arch.name }}/"
           echo "=== CAVS/AVS2 check ==="
-          strings "artifacts/${{ matrix.arch.name }}/libmpv.so" | grep -iE "cavs|avs2|davs2|guangdian" | head -20 || echo "WARNING: no CAVS/AVS2"
-          echo "=== NEEDED check ==="
-          readelf -d "artifacts/${{ matrix.arch.name }}/libmpv.so" 2>/dev/null | grep NEEDED || echo "(none)"
+          for so in "artifacts/${{ matrix.arch.name }}"/*.so; do
+            base=$(basename "$so")
+            cavs=$(strings "$so" | grep -ciE "cavs|avs2|davs2" 2>/dev/null || echo 0)
+            echo "  $base: CAVS/AVS2 strings = $cavs"
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -280,21 +278,23 @@ jobs:
             if [ -d "$DIR" ]; then
               mkdir -p "release/jniLibs/$arch"
               cp "$DIR"/*.so "release/jniLibs/$arch/"
+              echo "=== $arch ==="
               ls -la "release/jniLibs/$arch/"
             fi
           done
           for arch in arm64-v8a armeabi-v7a; do
-            [ -f "release/jniLibs/$arch/libmpv.so" ] || { echo "ERROR: missing $arch"; exit 1; }
+            [ -f "release/jniLibs/$arch/libmpv.so" ] || { echo "ERROR: missing $arch libmpv.so"; exit 1; }
+            [ -f "release/jniLibs/$arch/libavcodec.so" ] || { echo "ERROR: missing $arch libavcodec.so"; exit 1; }
           done
           cd release
-          tar czf libmpv-cavs-android-static.tar.gz jniLibs
-          ls -lh libmpv-cavs-android-static.tar.gz
+          tar czf libmpv-cavs-android-dynamic.tar.gz jniLibs
+          ls -lh libmpv-cavs-android-dynamic.tar.gz
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
-          files: release/libmpv-cavs-android-static.tar.gz
+          files: release/libmpv-cavs-android-dynamic.tar.gz
           fail_on_unmatched_files: true
           overwrite_files: true
         env:
