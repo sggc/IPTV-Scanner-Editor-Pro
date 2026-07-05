@@ -161,20 +161,25 @@ jobs:
           DAVS2_DIR=$(find . -type d -name "davs2" | grep -v ".git" | head -1)
           [ -d "$DAVS2_DIR/source" ] || { echo "ERROR: davs2 source not found"; exit 1; }
           cd "$DAVS2_DIR"
-          # davs2 crashes (SIGSEGV) in davs2_destroy_dpb when called from
+          # davs2 crashes (SIGSEGV) when destroy_dpb(mgr) is called from
           # davs2_decoder_close with an incompletely initialized decoder.
-          # Fix: add null checks in destroy/close functions.
-          # Handle both styles: "func() {" and "func()\n{"
-          find source/ -name '*.c' | while read -r f; do
-            # Style 1: opening brace on same line as function signature
-            sed -i '/^void davs2_destroy_dpb/s/{/{\n    if (!h) return;/' "$f"
-            sed -i '/^void davs2_decoder_close/s/{/{\n    if (!h) return;/' "$f"
-            # Style 2: opening brace on next line
-            sed -i '/^void davs2_destroy_dpb(/{n;s/^{$/{\n    if (!h) return;/}' "$f"
-            sed -i '/^void davs2_decoder_close(/{n;s/^{$/{\n    if (!h) return;/}' "$f"
-          done
+          # The DPB array (mgr->dpb) may be NULL if no frame was decoded.
+          # Also decoder_close(h) may access uninitialized fields.
+          # Fix: add null checks at the call sites in davs2.cc and decoder_close in decoder.cc.
+          # Note: davs2 source files are .cc (C++), not .c
+          DAVS2_CC="source/common/davs2.cc"
+          DECODER_CC="source/common/decoder.cc"
+          [ -f "$DAVS2_CC" ] || { echo "ERROR: $DAVS2_CC not found"; exit 1; }
+          # Patch 1: Guard destroy_dpb call in davs2_decoder_close
+          sed -i 's/^\(\s*\)destroy_dpb(mgr);/\1if (mgr->dpb != NULL) destroy_dpb(mgr);/' "$DAVS2_CC"
+          # Patch 2: Guard destroy_all_lists call (belt-and-suspenders)
+          # Patch 3: Add null check at start of decoder_close in decoder.cc
+          if [ -f "$DECODER_CC" ]; then
+            sed -i '/^void decoder_close(davs2_t \*h)/s/{/{\n    if (h == NULL) return;/' "$DECODER_CC"
+          fi
           echo "=== davs2 patch verification ==="
-          grep -rn "if (!h)" source/ | head -20
+          grep -n "if (mgr->dpb" "$DAVS2_CC" || echo "WARNING: davs2.cc patch not found"
+          grep -n "if (h == NULL)" "$DECODER_CC" 2>/dev/null || echo "WARNING: decoder.cc patch not found"
 
       - name: Apply CAVS patches to FFmpeg
         run: |
