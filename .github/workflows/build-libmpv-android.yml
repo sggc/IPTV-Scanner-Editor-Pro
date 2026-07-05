@@ -89,57 +89,60 @@ jobs:
           sed -i '/^\[ ! -d dav1d \] && git clone https:\/\/github.com\/videolan\/dav1d$/a # davs2\n[ ! -d davs2 ] \&\& git clone --depth 1 --branch 1.7 https:\/\/github.com\/pkuvcl\/davs2.git' include/download-deps.sh
 
           # === 3. Create scripts/davs2.sh (dynamic build) ===
-          cat > scripts/davs2.sh << 'DAVS2EOF'
-          #!/bin/bash -e
-          . ../../include/path.sh
-          if [ "$1" == "build" ]; then
-          	true
-          elif [ "$1" == "clean" ]; then
-          	rm -rf _build$ndk_suffix
-          	exit 0
-          else
-          	exit 255
-          fi
-          export CC="$CXX"
-          git fetch origin --depth 1 master:refs/remotes/origin/master
-          cd build/linux
-          ./configure \
-          	--host=$ndk_triple \
-          	--prefix=/ \
-          	--enable-shared \
-          	--disable-static \
-          	--enable-pic \
-          	--disable-asm
-          make -j$cores lib-shared
-          make DESTDIR="$prefix_dir" install-lib-shared
-          DAVS2EOF
+          # Using printf to avoid heredoc indentation issues in YAML
+          printf '%s\n' \
+            '#!/bin/bash -e' \
+            '. ../../include/path.sh' \
+            'if [ "$1" == "build" ]; then' \
+            '	true' \
+            'elif [ "$1" == "clean" ]; then' \
+            '	rm -rf _build$ndk_suffix' \
+            '	exit 0' \
+            'else' \
+            '	exit 255' \
+            'fi' \
+            'export CC="$CXX"' \
+            'git fetch origin --depth 1 master:refs/remotes/origin/master' \
+            'cd build/linux' \
+            './configure \' \
+            '	--host=$ndk_triple \' \
+            '	--prefix=/ \' \
+            '	--enable-shared \' \
+            '	--disable-static \' \
+            '	--enable-pic \' \
+            '	--disable-asm' \
+            'make -j$cores lib-shared' \
+            'make DESTDIR="$prefix_dir" install-lib-shared' \
+            > scripts/davs2.sh
           chmod +x scripts/davs2.sh
 
           # === 4. Patch ffmpeg.sh ===
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
           sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os/' scripts/ffmpeg.sh
-          cat > /tmp/decoders.txt << 'DECEOF'
-          	--disable-decoders
-          	--enable-decoder=h264,hevc,mpeg1video,mpeg2video,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3
-          	--enable-decoder=h263,h263i,h263p,flv,svq1,svq3,amv
-          	--enable-decoder=vp3,vp5,vp6,vp6a,vp6f,vp7,vp8,vp9,av1
-          	--enable-decoder=cavs,libdav1d,libdavs2,dra,avs3
-          	--enable-decoder=vc1,vc1image,wmv1,wmv2,wmv3,wmv3image
-          	--enable-decoder=theora,dvvideo,rawvideo
-          	--enable-decoder=mjpeg,jpegls,png,prores,ffv1,huffyuv
-          	--enable-decoder=rv10,rv20,rv30,rv40
-          	--enable-decoder=4xm,qtrle,cinepak,msrle,msvideo1,utvideo,indeo3,indeo5
-          	--enable-decoder=zlib,bzlib
-          	--enable-decoder=h264_mediacodec,hevc_mediacodec,mpeg2_mediacodec,mpeg4_mediacodec,vp8_mediacodec,vp9_mediacodec,av1_mediacodec
-          	--enable-decoder=aac,aac_latm,mp3,mp2,mp1,ac3,eac3,dca,flac,opus,vorbis,alac
-          	--enable-decoder=pcm_s16le,pcm_s24le,pcm_s32le,pcm_s16be,pcm_s24be,pcm_s32be
-          	--enable-decoder=pcm_u8,pcm_f32le,pcm_f64le,pcm_s8,pcm_u16le,pcm_u24le,pcm_u32le
-          	--enable-decoder=adpcm_ima_wav,adpcm_ms,adpcm_adx,adpcm_swf,g729
-          	--enable-decoder=wmav1,wmav2,wmapro,wmalossless,wmavoice,cook,ra_144,ra_288,sipr
-          	--enable-decoder=truehd,mlp,atrac3,atrac1,atrac3p
-          	--enable-decoder=amrnb,amrwb,g726,g722
-          	--enable-decoder=tak,tta,ape,shorten,imc
-          DECEOF
+
+          # === 4c. Decoder stripping via printf ===
+          printf '%s\n' \
+            '	--disable-decoders' \
+            '	--enable-decoder=h264,hevc,mpeg1video,mpeg2video,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3' \
+            '	--enable-decoder=h263,h263i,h263p,flv,svq1,svq3,amv' \
+            '	--enable-decoder=vp3,vp5,vp6,vp6a,vp6f,vp7,vp8,vp9,av1' \
+            '	--enable-decoder=cavs,libdav1d,libdavs2,dra,avs3' \
+            '	--enable-decoder=vc1,vc1image,wmv1,wmv2,wmv3,wmv3image' \
+            '	--enable-decoder=theora,dvvideo,rawvideo' \
+            '	--enable-decoder=mjpeg,jpegls,png,prores,ffv1,huffyuv' \
+            '	--enable-decoder=rv10,rv20,rv30,rv40' \
+            '	--enable-decoder=4xm,qtrle,cinepak,msrle,msvideo1,utvideo,indeo3,indeo5' \
+            '	--enable-decoder=zlib,bzlib' \
+            '	--enable-decoder=h264_mediacodec,hevc_mediacodec,mpeg2_mediacodec,mpeg4_mediacodec,vp8_mediacodec,vp9_mediacodec,av1_mediacodec' \
+            '	--enable-decoder=aac,aac_latm,mp3,mp2,mp1,ac3,eac3,dca,flac,opus,vorbis,alac' \
+            '	--enable-decoder=pcm_s16le,pcm_s24le,pcm_s32le,pcm_s16be,pcm_s24be,pcm_s32be' \
+            '	--enable-decoder=pcm_u8,pcm_f32le,pcm_f64le,pcm_s8,pcm_u16le,pcm_u24le,pcm_u32le' \
+            '	--enable-decoder=adpcm_ima_wav,adpcm_ms,adpcm_adx,adpcm_swf,g729' \
+            '	--enable-decoder=wmav1,wmav2,wmapro,wmalossless,wmavoice,cook,ra_144,ra_288,sipr' \
+            '	--enable-decoder=truehd,mlp,atrac3,atrac1,atrac3p' \
+            '	--enable-decoder=amrnb,amrwb,g726,g722' \
+            '	--enable-decoder=tak,tta,ape,shorten,imc' \
+            > /tmp/decoders.txt
           sed -i '/--disable-{muxers,encoders,devices}/r /tmp/decoders.txt' scripts/ffmpeg.sh
           echo "=== ffmpeg.sh ==="
           grep -c "enable-decoder" scripts/ffmpeg.sh
@@ -158,31 +161,20 @@ jobs:
           DAVS2_DIR=$(find . -type d -name "davs2" | grep -v ".git" | head -1)
           [ -d "$DAVS2_DIR/source" ] || { echo "ERROR: davs2 source not found"; exit 1; }
           cd "$DAVS2_DIR"
-          python3 << 'PYEOF'
-import os, re
-for root, dirs, files in os.walk('source'):
-    for fname in files:
-        if not fname.endswith('.c'):
-            continue
-        fpath = os.path.join(root, fname)
-        with open(fpath, 'r') as f:
-            content = f.read()
-        original = content
-        for func in ['davs2_destroy_dpb', 'davs2_decoder_close']:
-            pattern = r'(' + func + r'\s*\([^)]*\)\s*\{)'
-            matches = list(re.finditer(pattern, content))
-            for m in reversed(matches):
-                params = re.search(r'\(\s*\w+\s+\*?\s*(\w+)', m.group(1))
-                param = params.group(1) if params else 'h'
-                pos = m.end()
-                content = content[:pos] + '\n    if (!' + param + ') return;' + content[pos:]
-        if content != original:
-            with open(fpath, 'w') as f:
-                f.write(content)
-            print(f"Patched: {fpath}")
-PYEOF
+          # davs2 crashes (SIGSEGV) in davs2_destroy_dpb when called from
+          # davs2_decoder_close with an incompletely initialized decoder.
+          # Fix: add null checks in destroy/close functions.
+          # Handle both styles: "func() {" and "func()\n{"
+          find source/ -name '*.c' | while read -r f; do
+            # Style 1: opening brace on same line as function signature
+            sed -i '/^void davs2_destroy_dpb/s/{/{\n    if (!h) return;/' "$f"
+            sed -i '/^void davs2_decoder_close/s/{/{\n    if (!h) return;/' "$f"
+            # Style 2: opening brace on next line
+            sed -i '/^void davs2_destroy_dpb(/{n;s/^{$/{\n    if (!h) return;/}' "$f"
+            sed -i '/^void davs2_decoder_close(/{n;s/^{$/{\n    if (!h) return;/}' "$f"
+          done
           echo "=== davs2 patch verification ==="
-          grep -rn "if (!" source/ | head -10
+          grep -rn "if (!h)" source/ | head -20
 
       - name: Apply CAVS patches to FFmpeg
         run: |
@@ -226,7 +218,7 @@ PYEOF
           cd mpv-android/buildscripts
           mkdir -p "artifacts/${{ matrix.arch.name }}"
           STRIP_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          
+
           PREFIX_LIB=""
           for d in "prefix/${{ matrix.arch.buildall_arg }}/lib" "prefix/arm64/lib" "prefix/armv7l/lib"; do
             if [ -d "$d" ] && ls "$d"/*.so 1>/dev/null 2>&1; then
@@ -234,13 +226,13 @@ PYEOF
               break
             fi
           done
-          
+
           if [ -z "$PREFIX_LIB" ]; then
             echo "ERROR: no .so files found in prefix"
             find . -name "*.so" -ls | head -30
             exit 1
           fi
-          
+
           echo "=== Collecting .so from $PREFIX_LIB ==="
           for so in "$PREFIX_LIB"/*.so; do
             [ -f "$so" ] || continue
@@ -253,14 +245,14 @@ PYEOF
             fi
             cp -L "$so" "artifacts/${{ matrix.arch.name }}/"
           done
-          
+
           if [ -f "$PREFIX_LIB/libdavs2.so" ]; then
             echo "libdavs2.so collected"
           else
             echo "WARNING: libdavs2.so not found in $PREFIX_LIB"
             find . -name "libdavs2.so" -ls 2>/dev/null || true
           fi
-          
+
           # === Fix versioned SONAME in libdavs2.so ===
           DAVS2_SO="artifacts/${{ matrix.arch.name }}/libdavs2.so"
           AVCODEC_SO="artifacts/${{ matrix.arch.name }}/libavcodec.so"
@@ -280,7 +272,7 @@ PYEOF
               echo "Patched libavcodec.so NEEDED: libdavs2.so.16 -> libdavs2.so"
             fi
           fi
-          
+
           echo "=== Final artifacts ==="
           ls -lh "artifacts/${{ matrix.arch.name }}/"
           echo "=== SONAME/NEEDED verification ==="
