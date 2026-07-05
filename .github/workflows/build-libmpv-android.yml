@@ -43,7 +43,7 @@ jobs:
             build-essential ninja-build pkg-config \
             nasm yasm python3-pip git autoconf automake libtool \
             cmake ccache unzip wget curl \
-            libssl-dev zlib1g-dev gperf
+            libssl-dev zlib1g-dev gperf patchelf
           sudo pip3 install --upgrade meson mako
           meson --version
 
@@ -185,7 +185,7 @@ jobs:
             elif grep -q 'AV_CODEC_ID_G728,' libavcodec/codec_id.h; then
               perl -i -pe 's/(AV_CODEC_ID_G728,)/$1\n    AV_CODEC_ID_DRA,/' libavcodec/codec_id.h
             else
-              echo "ERROR: cannot add DRA"; exit 1
+              echo "ERROR: cannot add DRA"; exit 1;
             fi
           fi
           ls -la libavcodec/libcavs* libavcodec/dradec* 2>/dev/null || { echo "ERROR: CAVS patch failed"; exit 1; }
@@ -239,8 +239,36 @@ jobs:
             find . -name "libdavs2.so" -ls 2>/dev/null || true
           fi
           
+          # === Fix versioned SONAME in libdavs2.so ===
+          # davs2 builds with SONAME "libdavs2.so.16", but Android only loads "libdavs2.so"
+          DAVS2_SO="artifacts/${{ matrix.arch.name }}/libdavs2.so"
+          AVCODEC_SO="artifacts/${{ matrix.arch.name }}/libavcodec.so"
+          if [ -f "$DAVS2_SO" ]; then
+            OLD_SONAME=$(patchelf --print-soname "$DAVS2_SO" 2>/dev/null || echo "")
+            echo "libdavs2.so current SONAME: '$OLD_SONAME'"
+            if [ "$OLD_SONAME" != "libdavs2.so" ]; then
+              patchelf --set-soname libdavs2.so "$DAVS2_SO"
+              echo "Patched libdavs2.so SONAME -> libdavs2.so"
+            fi
+          fi
+          if [ -f "$AVCODEC_SO" ]; then
+            NEEDED=$(patchelf --print-needed "$AVCODEC_SO" 2>/dev/null | grep davs2 || echo "")
+            echo "libavcodec.so davs2 NEEDED: '$NEEDED'"
+            if echo "$NEEDED" | grep -q "libdavs2.so.16"; then
+              patchelf --replace-needed libdavs2.so.16 libdavs2.so "$AVCODEC_SO"
+              echo "Patched libavcodec.so NEEDED: libdavs2.so.16 -> libdavs2.so"
+            fi
+          fi
+          
           echo "=== Final artifacts ==="
           ls -lh "artifacts/${{ matrix.arch.name }}/"
+          echo "=== SONAME/NEEDED verification ==="
+          for so in "artifacts/${{ matrix.arch.name }}"/*.so; do
+            base=$(basename "$so")
+            soname=$(patchelf --print-soname "$so" 2>/dev/null || echo "N/A")
+            needed=$(patchelf --print-needed "$so" 2>/dev/null | grep davs2 || echo "")
+            echo "  $base: SONAME=$soname  davs2_NEEDED=$needed"
+          done
           echo "=== CAVS/AVS2 check ==="
           for so in "artifacts/${{ matrix.arch.name }}"/*.so; do
             base=$(basename "$so")
