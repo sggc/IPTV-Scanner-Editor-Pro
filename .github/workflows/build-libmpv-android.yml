@@ -1,10 +1,5 @@
 name: Build libmpv with CAVS/AVS2 support (Android, dynamic, stripped, optimized)
 
-# Build libmpv for Android with CAVS (Guangdian) + AVS2 support
-# Dynamic linking (compatible with libplayer.so from Maven)
-# Optimized: decoder stripped + size optimized + llvm-strip
-# Output: libmpv.so + FFmpeg .so + libdavs2.so per arch
-
 on:
   workflow_dispatch:
     inputs:
@@ -121,17 +116,14 @@ jobs:
           chmod +x scripts/davs2.sh
 
           # === 4. Patch ffmpeg.sh ===
-          # 4a. Enable libdavs2
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
-          # 4b. Add size optimization flags (keep dynamic linking, no static changes)
           sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os/' scripts/ffmpeg.sh
-          # 4c. Decoder stripping: write block to temp file then insert with sed r
           cat > /tmp/decoders.txt << 'DECEOF'
           	--disable-decoders
           	--enable-decoder=h264,hevc,mpeg1video,mpeg2video,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3
           	--enable-decoder=h263,h263i,h263p,flv,svq1,svq3,amv
           	--enable-decoder=vp3,vp5,vp6,vp6a,vp6f,vp7,vp8,vp9,av1
-          	--enable-decoder=cavs,libdav1d,libdavs2,dra
+          	--enable-decoder=cavs,libdav1d,libdavs2,dra,avs3
           	--enable-decoder=vc1,vc1image,wmv1,wmv2,wmv3,wmv3image
           	--enable-decoder=theora,dvvideo,rawvideo
           	--enable-decoder=mjpeg,jpegls,png,prores,ffv1,huffyuv
@@ -160,6 +152,38 @@ jobs:
           echo "=== davs2 source ==="
           ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 not found"; exit 1; }
 
+      - name: Patch davs2 for crash safety
+        run: |
+          cd mpv-android/buildscripts
+          DAVS2_DIR=$(find . -type d -name "davs2" | grep -v ".git" | head -1)
+          [ -d "$DAVS2_DIR/source" ] || { echo "ERROR: davs2 source not found"; exit 1; }
+          cd "$DAVS2_DIR"
+          python3 << 'PYEOF'
+import os, re
+for root, dirs, files in os.walk('source'):
+    for fname in files:
+        if not fname.endswith('.c'):
+            continue
+        fpath = os.path.join(root, fname)
+        with open(fpath, 'r') as f:
+            content = f.read()
+        original = content
+        for func in ['davs2_destroy_dpb', 'davs2_decoder_close']:
+            pattern = r'(' + func + r'\s*\([^)]*\)\s*\{)'
+            matches = list(re.finditer(pattern, content))
+            for m in reversed(matches):
+                params = re.search(r'\(\s*\w+\s+\*?\s*(\w+)', m.group(1))
+                param = params.group(1) if params else 'h'
+                pos = m.end()
+                content = content[:pos] + '\n    if (!' + param + ') return;' + content[pos:]
+        if content != original:
+            with open(fpath, 'w') as f:
+                f.write(content)
+            print(f"Patched: {fpath}")
+PYEOF
+          echo "=== davs2 patch verification ==="
+          grep -rn "if (!" source/ | head -10
+
       - name: Apply CAVS patches to FFmpeg
         run: |
           cd mpv-android/buildscripts
@@ -185,7 +209,7 @@ jobs:
             elif grep -q 'AV_CODEC_ID_G728,' libavcodec/codec_id.h; then
               perl -i -pe 's/(AV_CODEC_ID_G728,)/$1\n    AV_CODEC_ID_DRA,/' libavcodec/codec_id.h
             else
-              echo "ERROR: cannot add DRA"; exit 1;
+              echo "ERROR: cannot add DRA"; exit 1
             fi
           fi
           ls -la libavcodec/libcavs* libavcodec/dradec* 2>/dev/null || { echo "ERROR: CAVS patch failed"; exit 1; }
@@ -203,7 +227,6 @@ jobs:
           mkdir -p "artifacts/${{ matrix.arch.name }}"
           STRIP_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           
-          # Find the prefix lib directory with all .so files
           PREFIX_LIB=""
           for d in "prefix/${{ matrix.arch.buildall_arg }}/lib" "prefix/arm64/lib" "prefix/armv7l/lib"; do
             if [ -d "$d" ] && ls "$d"/*.so 1>/dev/null 2>&1; then
@@ -231,7 +254,6 @@ jobs:
             cp -L "$so" "artifacts/${{ matrix.arch.name }}/"
           done
           
-          # Also check for libdavs2.so in prefix
           if [ -f "$PREFIX_LIB/libdavs2.so" ]; then
             echo "libdavs2.so collected"
           else
@@ -240,7 +262,6 @@ jobs:
           fi
           
           # === Fix versioned SONAME in libdavs2.so ===
-          # davs2 builds with SONAME "libdavs2.so.16", but Android only loads "libdavs2.so"
           DAVS2_SO="artifacts/${{ matrix.arch.name }}/libdavs2.so"
           AVCODEC_SO="artifacts/${{ matrix.arch.name }}/libavcodec.so"
           if [ -f "$DAVS2_SO" ]; then
