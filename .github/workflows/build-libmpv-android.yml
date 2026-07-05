@@ -4,7 +4,7 @@ name: Build libmpv with CAVS/AVS2 support (Android, static, stripped)
 #   1. FFmpeg 静态链接进 libmpv.so（不再产出独立 libavcodec.so 等，避免与 nextlib 冲突）
 #   2. FFmpeg 裁剪解码器（只保留 IPTV 常用格式，体积从 ~100MB 降到 ~15-20MB）
 #   3. 只构建 arm64-v8a 和 armeabi-v7a（匹配主项目 build.gradle）
-#   4. 最终产物只有 libmpv.so 一个文件
+#   4. 最终产物只有 libmpv.so 一个文件 
 #
 # CAVS (AVS1-P16, 广电 profile) 通过 patch 修改内置 cavs 解码器实现
 # AVS2 (4K) 通过 libdavs2 外部库实现（--enable-libdavs2，静态链接）
