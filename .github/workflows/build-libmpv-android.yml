@@ -1,34 +1,26 @@
-name: Build libmpv with CAVS support (Android)
+name: Build libmpv with CAVS/AVS2 support (Android, static, stripped)
 
-# 构建 Android 版 libmpv（带 CAVS Guangdian profile 支持）
-# 使用 mpv-android 官方 buildscripts + llawsxx/FFmpeg 的 6 个 CAVS patch
-# 产物上传到 GitHub Release，供 build.yml 下载使用
+# 构建 Android 版 libmpv（带 CAVS Guangdian profile + AVS2 支持）
+#   1. FFmpeg 静态链接进 libmpv.so（不再产出独立 libavcodec.so 等，避免与 nextlib 冲突）
+#   2. FFmpeg 裁剪解码器（只保留 IPTV 常用格式，体积从 ~100MB 降到 ~15-20MB）
+#   3. 只构建 arm64-v8a 和 armeabi-v7a（匹配主项目 build.gradle）
+#   4. 最终产物只有 libmpv.so 一个文件
 #
 # CAVS (AVS1-P16, 广电 profile) 通过 patch 修改内置 cavs 解码器实现
-# AVS2 (4K) 通过 libdavs2 外部库实现（--enable-libdavs2）
-# 两者并存，不丢失任何其他解码器
-#
-# 构建方式：
-# 1. 克隆 mpv-android 仓库
-# 2. 修改 buildscripts：添加 davs2 依赖声明、下载逻辑、构建脚本，FFmpeg 启用 libdavs2
-# 3. 运行 buildscripts/download.sh 下载所有依赖（含 davs2 源码）
-# 4. 在 FFmpeg 源码上手动应用 CAVS patch
-# 5. 运行 buildscripts/buildall.sh 构建各 ABI 的 libmpv
-# 6. 提取 libmpv.so 文件打包
+# AVS2 (4K) 通过 libdavs2 外部库实现（--enable-libdavs2，静态链接）
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to upload libmpv to (e.g. libmpv-cavs-latest)"
+        description: "Release tag to upload libmpv to (e.g. libmpv-cavs-static-latest)"
         required: true
-        default: "libmpv-cavs-latest"
+        default: "libmpv-cavs-static-latest"
 
 permissions:
   contents: write
 
 env:
-  # mpv-android 仓库版本（使用最新 release tag）
   MPV_ANDROID_REF: "2026-04-25"
 
 jobs:
@@ -40,21 +32,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 4 种 ABI 分别构建（并行）
+        # 只构建主项目需要的两个 ABI
         arch:
           - { name: arm64-v8a, buildall_arg: arm64 }
           - { name: armeabi-v7a, buildall_arg: armv7l }
-          - { name: x86_64, buildall_arg: x86_64 }
-          - { name: x86, buildall_arg: x86 }
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install build dependencies
-        # mpv-android buildscripts 在 Linux 上运行需要的依赖
-        # 注意：不通过 apt 安装 meson（1.3.2 版本太旧，fontconfig 要求 >= 1.6.1），
-        # 改用 pip 安装最新版 meson
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -75,7 +62,6 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install Android NDK
-        # mpv-android buildscripts 需要 NDK r29
         run: |
           yes | sdkmanager --licenses || true
           sdkmanager "ndk;29.0.14206865" "platform-tools"
@@ -95,7 +81,6 @@ jobs:
           ls -la buildscripts/include/ 2>/dev/null || true
 
       - name: Download CAVS patches
-        # 下载 llawsxx/FFmpeg 的 6 个 CAVS 相关 commits 作为 patch
         run: |
           mkdir -p cavs_patches
           CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
@@ -106,44 +91,35 @@ jobs:
           done
           ls -la cavs_patches/
 
-      - name: Add libdavs2 support for AVS2 decoding
-        # 修改 mpv-android buildscripts，集成 libdavs2 (AVS2 解码器)：
-        # 1. include/depinfo.sh：声明 v_davs2 版本、dep_davs2 空依赖、把 davs2 加入 dep_ffmpeg
-        # 2. include/download-deps.sh：添加 davs2 源码下载逻辑（git clone 1.7）
-        # 3. scripts/davs2.sh：autotools 交叉编译脚本（--host=$ndk_triple, DESTDIR=$prefix_dir）
-        # 4. scripts/ffmpeg.sh：在 --enable-{...} 中追加 libdavs2
-        # 这样 buildall.sh 会按依赖树自动构建 davs2，再构建 FFmpeg（含 libdavs2）
-        #
-        # 注意：pkuvcl/davs2 仓库最新 tag 是 1.7（无 v1.8.1，无 release）
-        # davs2 是 C++ 项目，默认用 g++，但 Android NDK 只有 clang++，需用 CXX 覆盖
-        # davs2 的 configure 不支持 CC=... 命令行赋值，需通过环境变量 export CC
+      - name: Configure buildscripts (davs2 + static FFmpeg + decoder stripping)
+        # 一次性完成所有 buildscripts 修改：
+        # 1. 添加 davs2 依赖声明和下载逻辑
+        # 2. 创建 davs2.sh（静态编译）
+        # 3. 修改 ffmpeg.sh：静态链接 + 裁剪解码器 + 启用 libdavs2
+        # 4. 修改 mpv.sh：创建 pkg-config --static 包装器 + 清理 .so 文件
         run: |
           cd mpv-android/buildscripts
 
-          # 1. 修改 depinfo.sh：添加 davs2 版本、依赖声明
-          #    v_davs2 紧跟在 v_libxml2 后面（版本号区）
+          # ========================================
+          # 1. depinfo.sh：添加 davs2 版本和依赖声明
+          # ========================================
           sed -i '/^v_libxml2=/a v_davs2=1.7' include/depinfo.sh
-          #    dep_davs2=() 紧跟在 dep_dav1d=() 后面（依赖树区）
           sed -i '/^dep_dav1d=/a dep_davs2=()' include/depinfo.sh
-          #    把 davs2 加入 FFmpeg 的依赖列表
           sed -i 's/dep_ffmpeg=(mbedtls dav1d libxml2)/dep_ffmpeg=(mbedtls dav1d libxml2 davs2)/' include/depinfo.sh
           echo "=== Patched depinfo.sh (davs2 entries) ==="
           grep -E "davs2|dep_ffmpeg=" include/depinfo.sh
 
-          # 2. 修改 download-deps.sh：在 dav1d 下载逻辑后添加 davs2 下载逻辑
-          #    使用 git clone --depth 1 --branch 1.7 拉取 pkuvcl/davs2
-          #    注意：sed 中 && 需转义为 \&\&
-          sed -i '/^\[ ! -d dav1d \] && git clone https:\/\/github.com\/videolan\/dav1d$/a # davs2\n[ ! -d davs2 ] \&\& git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git' include/download-deps.sh
+          # ========================================
+          # 2. download-deps.sh：添加 davs2 源码下载
+          # ========================================
+          sed -i '/^\[ ! -d dav1d \] && git clone https:\/\/github.com\/videolan\/dav1d$/a # davs2\n[ ! -d davs2 ] \&\& git clone --depth 1 --branch 1.7 https:\/\/github.com\/pkuvcl\/davs2.git' include/download-deps.sh
           echo "=== Patched download-deps.sh (davs2 section) ==="
           grep -A2 -B1 "davs2" include/download-deps.sh
 
-          # 3. 创建 scripts/davs2.sh：autotools 交叉编译
-          #    - configure 在 build/linux/ 子目录中（davs2 项目结构特殊）
-          #    - davs2 默认用 g++，但 NDK 只有 clang++，所以 export CC=$CXX
-          #    - --host=$ndk_triple 触发交叉编译
-          #    - --prefix=/ + DESTDIR=$prefix_dir 安装到 staging 目录
-          #    - --disable-asm 避免 armv7/x86 上的汇编兼容问题
-          #    - --enable-pic 生成位置无关代码（动态库所需）
+          # ========================================
+          # 3. 创建 scripts/davs2.sh（静态编译）
+          #    静态库会被链接进 FFmpeg 的 .a，最终全部嵌入 libmpv.so
+          # ========================================
           cat > scripts/davs2.sh <<'DAVS2_EOF'
           #!/bin/bash -e
           . ../../include/path.sh
@@ -157,65 +133,138 @@ jobs:
           fi
           # davs2 是 C++ 项目（默认用 g++），NDK 只有 clang++，用 CXX 覆盖
           export CC="$CXX"
-          # 根因修复：version.sh 用 `git rev-list --count origin/master` 获取构建号(VER_R)，
-          # 浅克隆 --branch 1.7 缺少 origin/master 引用，导致 VER_R 变空、POINTVER 变成 "1.6."，
-          # davs2.pc 的 Version 字段不完整，FFmpeg 的 "davs2 >= 1.6.0" 检查失败。
-          # 注意：`git fetch origin master` 只更新 FETCH_HEAD，不创建 refs/remotes/origin/master，
-          # 必须用 refspec `master:refs/remotes/origin/master` 显式创建引用，
-          # 否则 `git rev-list --count origin/master` 仍然失败。
+          # 修复 version.sh 需要 origin/master 引用
           git fetch origin --depth 1 master:refs/remotes/origin/master
           cd build/linux
+          # 静态编译：--disable-shared --enable-static
+          # --enable-pic：生成位置无关代码（libmpv.so 是动态库，需要 -fPIC）
+          # --disable-asm：避免 armv7/x86 汇编兼容问题
           ./configure \
           	--host=$ndk_triple \
           	--prefix=/ \
-          	--enable-shared \
-          	--disable-static \
+          	--disable-shared \
+          	--enable-static \
           	--enable-pic \
           	--disable-asm
-          # 根因修复：davs2 configure 在 Linux 上生成 SONAME=libdavs2.so.$API（如 libdavs2.so.16），
-          # FFmpeg 链接时将此 SONAME 写入 NEEDED entry。但 Android 动态链接器不支持带版本号
-          # 的 .so 文件名（libdavs2.so.16），导致加载时报 UnsatisfiedLinkError:
-          # library "libdavs2.so.16" not found: needed by libavcodec.so。
-          # 修复：将 config.mak 中的 SONAME 改为不带版本号的 libdavs2.so，
-          # 这样 FFmpeg 的 NEEDED entry 就是 libdavs2.so，Android 能正确加载。
-          sed -i 's/^SONAME=libdavs2\.so\..*/SONAME=libdavs2.so/' config.mak
-          echo "=== Patched SONAME in config.mak ==="
-          grep SONAME config.mak
-          # 根因修复：davs2 configure 默认开启 cli，会在 config.mak 中写入
-          # `default: cli` 和 `install: install-cli`，导致 `make` 和 `make install`
-          # 都会构建 test/test.c 的可执行文件 davs2$(EXE)。该 test 二进制调用
-          # __android_log_print 需要 -llog，但 configure 生成的 Makefile 未添加此库，
-          # 导致链接失败：ld.lld: error: undefined symbol: __android_log_print
-          # 我们只需要 libdavs2.so 共享库，不需要 test 可执行文件，因此显式指定
-          # lib-shared 目标构建共享库，install-lib-shared 目标安装共享库+头文件+.pc。
-          make -j$cores lib-shared
-          make DESTDIR="$prefix_dir" install-lib-shared
-          # Android 不支持带版本号的 .so 文件名（libdavs2.so.16.0.0）。
-          # davs2 install 生成：libdavs2.so.<ver> 实际文件 + libdavs2.so 符号链接。
-          # find -name "lib*.so" -type f 只匹配实际文件，符号链接被遗漏。
-          # 修复：用 cp -L 跟随符号链接，将 libdavs2.so 转为实际文件，
-          # 删除带版本号的文件和符号链接，确保 find 能收集到 libdavs2.so。
-          cd "$prefix_dir/lib"
-          cp -L libdavs2.so libdavs2_real.so && mv -f libdavs2_real.so libdavs2.so
-          rm -f libdavs2.so.[0-9]*
-          echo "=== davs2 .so files after de-version ==="
-          ls -la libdavs2*
+          # 只构建静态库，跳过 test 二进制（test 需要 -llog，链接会失败）
+          make -j$cores lib-static
+          make DESTDIR="$prefix_dir" install-lib-static
           DAVS2_EOF
           chmod +x scripts/davs2.sh
-          echo "=== Created scripts/davs2.sh ==="
-          cat scripts/davs2.sh
+          echo "=== Created scripts/davs2.sh (static) ==="
 
-          # 4. 修改 scripts/ffmpeg.sh：在 --enable-{...} 中追加 libdavs2
-          #    bash brace expansion 会展开为 --enable-libdavs2
+          # ========================================
+          # 4. 修改 scripts/ffmpeg.sh
+          #    a) --enable-libdavs2
+          #    b) 共享→静态
+          #    c) 裁剪解码器（只保留 IPTV 常用格式）
+          # ========================================
+
+          # 4a. 添加 --enable-libdavs2
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
           echo "=== Patched ffmpeg.sh (libdavs2 enabled) ==="
           grep "enable-" scripts/ffmpeg.sh
 
+          # 4b. + 4c. 用 Python 做可靠的多行修改
+          python3 <<'PYEOF'
+          with open('scripts/ffmpeg.sh', 'r') as f:
+              content = f.read()
+
+          # 共享 → 静态
+          content = content.replace(
+              '--disable-static --enable-shared',
+              '--enable-static --disable-shared'
+          )
+
+          # 在 --disable-{muxers,encoders,devices} 后面插入解码器裁剪
+          old_line = '\t--disable-{muxers,encoders,devices}'
+          new_lines = """\t--disable-{muxers,encoders,devices}
+\t# === 解码器裁剪（只保留 IPTV 常用格式）===
+\t--disable-decoders
+\t# 视频解码器（IPTV/点播常见格式）
+\t--enable-decoder=h264,hevc,mpeg1video,mpeg2video,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3
+\t--enable-decoder=h263,h263i,h263p,flv,svq1,svq3,amv
+\t--enable-decoder=vp3,vp5,vp6,vp6a,vp6f,vp7,vp8,vp9,av1
+\t--enable-decoder=cavs,libdav1d,libdavs2,dra
+\t--enable-decoder=vc1,vc1image,wmv1,wmv2,wmv3,wmv3image
+\t--enable-decoder=theora,dvvideo,rawvideo
+\t--enable-decoder=mjpeg,jpegls,png,prores,ffv1,huffyuv
+\t--enable-decoder=rv10,rv20,rv30,rv40
+\t--enable-decoder=4xm,qtrle,cinepak,msrle,msvideo1,utvideo,indeo3,indeo5
+\t--enable-decoder=zlib,bzlib
+\t# MediaCodec 硬件解码器（FFmpeg 层）
+\t--enable-decoder=h264_mediacodec,hevc_mediacodec,mpeg2_mediacodec,mpeg4_mediacodec,vp8_mediacodec,vp9_mediacodec,av1_mediacodec
+\t# 音频解码器（IPTV/点播常见格式）
+\t--enable-decoder=aac,aac_latm,mp3,mp2,mp1,ac3,eac3,dca,flac,opus,vorbis,alac
+\t--enable-decoder=pcm_s16le,pcm_s24le,pcm_s32le,pcm_s16be,pcm_s24be,pcm_s32be
+\t--enable-decoder=pcm_u8,pcm_f32le,pcm_f64le,pcm_s8,pcm_u16le,pcm_u24le,pcm_u32le
+\t--enable-decoder=adpcm_ima_wav,adpcm_ms,adpcm_adx,adpcm_swf,g729
+\t--enable-decoder=wmav1,wmav2,wmapro,wmalossless,wmavoice,cook,ra_144,ra_288,sipr
+\t--enable-decoder=truehd,mlp,atrac3,atrac1,atrac3p
+\t--enable-decoder=amrnb,amrwb,g726,g722
+\t--enable-decoder=tak,tta,ape,shorten,imc"""
+
+          content = content.replace(old_line, new_lines)
+
+          with open('scripts/ffmpeg.sh', 'w') as f:
+              f.write(content)
+          print("=== Patched ffmpeg.sh (static + decoder stripping) ===")
+          PYEOF
+
+          echo "=== Verifying ffmpeg.sh ==="
+          grep -E "static|shared|disable-decoders|enable-decoder" scripts/ffmpeg.sh | head -20
+
+          # ========================================
+          # 5. 修改 scripts/mpv.sh
+          #    a) 创建 pkg-config --static 包装器（确保 meson 解析静态库的传递依赖）
+          #    b) 清理 prefix 中的 .so 文件（强制静态链接）
+          #    c) 保持 --default-library shared（libmpv.so 必须是动态库）
+          # ========================================
+          python3 <<'PYEOF'
+          with open('scripts/mpv.sh', 'r') as f:
+              content = f.read()
+
+          # 在 "unset CC CXX" 之前插入静态链接准备代码
+          prep_code = """# === 静态链接准备 ===
+# 创建 pkg-config --static 包装器，确保 meson 解析 .pc 文件时包含 Libs.private
+# （静态库没有 NEEDED entry，传递依赖必须通过 pkg-config --static 显式获取）
+cat > "$prefix_dir/pkg-config-static" <<'PCWRAPPER'
+#!/bin/bash
+exec pkg-config --static "$@"
+PCWRAPPER
+chmod +x "$prefix_dir/pkg-config-static"
+
+# 修改 cross-file 使用我们的包装器
+sed -i "s|pkgconfig = 'pkg-config'|pkgconfig = '$prefix_dir/pkg-config-static'|" "$prefix_dir/crossfile.txt"
+sed -i "s|pkg-config = 'pkg-config'|pkg-config = '$prefix_dir/pkg-config-static'|" "$prefix_dir/crossfile.txt"
+echo "=== Cross-file pkg-config patched to use --static ==="
+
+# 删除 prefix 中所有 .so 文件（强制 meson 只能找到 .a 静态库）
+# meson 依赖（dav1d/libxml2/harfbuzz 等）由 cross-file 的 default_library=static 构建，已经是 .a
+# FFmpeg/davs2 我们改成了静态，也是 .a
+# mbedtls/lua 的 Makefile 会同时产出 .a 和 .so，删掉 .so 确保万无一失
+find "$prefix_dir/lib" \\( -name "*.so" -o -name "*.so.*" \\) -delete 2>/dev/null || true
+echo "=== Cleaned shared libraries from prefix ==="
+echo "Remaining .a files:"
+find "$prefix_dir/lib" -name "*.a" -ls | head -20
+echo "Remaining .so files (should be none):"
+find "$prefix_dir/lib" -name "*.so" -ls || echo "(none)"
+
+"""
+
+          content = content.replace('unset CC CXX # meson wants these unset', prep_code + 'unset CC CXX # meson wants these unset')
+
+          with open('scripts/mpv.sh', 'w') as f:
+              f.write(content)
+          print("=== Patched mpv.sh (pkg-config --static + .so cleanup) ===")
+          PYEOF
+
+          echo "=== Verifying mpv.sh ==="
+          head -40 scripts/mpv.sh
+
       - name: Download dependencies
-        # 运行 download.sh 下载所有依赖（包括 FFmpeg 和 davs2 源码）
         run: |
           cd mpv-android/buildscripts
-          # 设置 IN_CI=1 使用稳定的 release 版本（n8.0.1）
           export IN_CI=1
           ./download.sh
           echo "=== FFmpeg source location ==="
@@ -223,13 +272,10 @@ jobs:
           echo "=== davs2 source location ==="
           ls -la deps/davs2/ 2>/dev/null || { echo "ERROR: davs2 source not downloaded"; exit 1; }
           ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 configure script not found"; exit 1; }
-          ls -la deps/ 2>/dev/null || true
 
       - name: Apply CAVS patches to FFmpeg
-        # 在 download.sh 下载 FFmpeg 后，手动应用 CAVS patch
         run: |
           cd mpv-android/buildscripts
-          # 查找 FFmpeg 源码目录（可能在 deps/ffmpeg 或 sources/ffmpeg）
           FFMPEG_DIR=""
           for candidate in deps/ffmpeg sources/ffmpeg; do
             if [ -d "$candidate/libavcodec" ]; then
@@ -248,9 +294,7 @@ jobs:
           echo "Found FFmpeg source: $FFMPEG_DIR"
           cd "$FFMPEG_DIR"
 
-          # 应用 CAVS patch：使用 --batch --forward 容忍失败的 hunk
           CAVS_PATCHES="d208cf8 48ad875 e633613 fb9a3ec 0de8ee1 4cd3e6d"
-          # 计算 patches 目录的绝对路径
           PATCHES_DIR="$(cd "$(dirname "$0")/../../cavs_patches" 2>/dev/null && pwd || echo "$GITHUB_WORKSPACE/cavs_patches")"
           echo "Using patches from: $PATCHES_DIR"
           for sha in $CAVS_PATCHES; do
@@ -259,12 +303,6 @@ jobs:
           done
 
           # 手动修复 codec_id.h：添加 AV_CODEC_ID_DRA
-          # patch d208cf8 的 codec_id.h hunk 期望在 AV_CODEC_ID_AHX 后添加 AV_CODEC_ID_DRA，
-          # 但不同 FFmpeg 版本的 codec_id.h 内容不同：
-          # - master 有 AV_CODEC_ID_AHX（hunk 因行号偏移失败）
-          # - n8.0.1 没有 AV_CODEC_ID_AHX（hunk 必然失败）
-          # 通用策略：优先在 AV_CODEC_ID_AHX 后添加（保持与 patch 一致）；
-          # 若不存在，则在音频 codec 末尾（AV_CODEC_ID_G728 后）添加，确保不改变现有 ID 值。
           if ! grep -q AV_CODEC_ID_DRA libavcodec/codec_id.h; then
             if grep -q 'AV_CODEC_ID_AHX,' libavcodec/codec_id.h; then
               perl -i -pe 's/(AV_CODEC_ID_AHX,)/$1\n    AV_CODEC_ID_DRA,/' libavcodec/codec_id.h
@@ -275,36 +313,29 @@ jobs:
               exit 1
             fi
           fi
-          # 验证修复成功
           grep -q AV_CODEC_ID_DRA libavcodec/codec_id.h || \
             { echo "ERROR: Failed to add AV_CODEC_ID_DRA to codec_id.h"; exit 1; }
           echo "=== AV_CODEC_ID_DRA added to codec_id.h ==="
 
-          # 验证 patch 应用结果
           echo "=== Verify CAVS files exist ==="
           ls -la libavcodec/libcavs* libavcodec/libcavsdec* libavcodec/dradec* 2>/dev/null || \
             { echo "ERROR: CAVS patch did not apply correctly"; exit 1; }
 
       - name: Build libmpv for ${{ matrix.arch.name }}
-        # 为当前 ABI 构建 libmpv
         run: |
           cd mpv-android/buildscripts
           export IN_CI=1
-          # 只构建 libmpv，不构建 APK
           ./buildall.sh --arch ${{ matrix.arch.buildall_arg }} mpv
           echo "=== Build artifacts ==="
           find . -name "libmpv.so" -ls 2>/dev/null || true
-          find . -name "*.so" -path "*/mpv/*" -ls 2>/dev/null || true
 
-      - name: Locate and collect libmpv.so
-        # 查找并收集构建产物
+      - name: Collect libmpv.so
+        # 只收集 libmpv.so（所有依赖已静态链接进去）
         run: |
           cd mpv-android/buildscripts
-          # mpv-android buildscripts 的产物通常在 build/<arch>/mpv/install_dir/lib/ 下
           ARTIFACT_DIR="artifacts/${{ matrix.arch.name }}"
           mkdir -p "$ARTIFACT_DIR"
 
-          # 查找 libmpv.so
           MPV_SO=$(find . -name "libmpv.so" -type f | head -1)
           if [ -z "$MPV_SO" ]; then
               echo "ERROR: libmpv.so not found for ${{ matrix.arch.name }}"
@@ -316,25 +347,27 @@ jobs:
           echo "Found libmpv.so: $MPV_SO"
           cp -L "$MPV_SO" "$ARTIFACT_DIR/"
 
-          # 收集 libmpv.so 依赖的所有动态库
-          # mpv-android buildscripts 的 ffmpeg.sh 使用 --enable-shared 构建 FFmpeg，安装到 prefix/<arch>/lib/；
-          # libdav1d/libdavs2 等外部库也安装在 prefix/<arch>/lib/。
-          # buildall.sh 的 setup_prefix() 创建符号链接 prefix/<arch>/usr -> . 和 prefix/<arch>/local -> .，
-          # 使 /usr/local/lib/ 解析到 prefix/<arch>/lib/，所以 FFmpeg 的 .so 物理上在 prefix/<arch>/lib/ 下。
-          # FFmpeg 的库包括 libavcodec/libavformat/libavutil/libswscale/libswresample/libavfilter/
-          # libavdevice/libpostproc 等，libmpv.so 动态依赖它们。
-          # 之前用 -path "*/prefix/lib/*" 无法匹配 prefix/<arch>/lib/ 路径（prefix 后是 /<arch>/ 不是 /lib/），
-          # 导致所有 FFmpeg .so 都被遗漏，libmpv.so 加载失败（UnsatisfiedLinkError: libavfilter.so not found）。
-          # 修复：直接在 prefix/ 目录下搜索所有 lib*.so，确保不遗漏任何依赖库。
-          find ./prefix -name "lib*.so" -type f -exec cp -L {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
-
           echo "=== Collected artifacts ==="
           ls -la "$ARTIFACT_DIR/"
 
           # 验证 CAVS 和 AVS2 支持
           echo "=== Checking cavs/avs2 strings in libmpv.so ==="
-          strings "$ARTIFACT_DIR/libmpv.so" | grep -iE "guangdian|jizhun|cavs|avs2|libdavs2" | head -20 || \
+          strings "$ARTIFACT_DIR/libmpv.so" | grep -iE "guangdian|jizhun|cavs|avs2|libdavs2|davs2" | head -20 || \
             echo "WARNING: Could not find CAVS/AVS2 strings in libmpv.so"
+
+          # 验证没有动态依赖 FFmpeg（应该全部静态链接了）
+          echo "=== Checking dynamic dependencies (should not have libavcodec etc.) ==="
+          if command -v readelf >/dev/null 2>&1; then
+            readelf -d "$ARTIFACT_DIR/libmpv.so" 2>/dev/null | grep NEEDED || echo "(readelf not available)"
+          elif command -v objdump >/dev/null 2>&1; then
+            objdump -p "$ARTIFACT_DIR/libmpv.so" 2>/dev/null | grep NEEDED || echo "(objdump not available)"
+          else
+            echo "(readelf/objdump not available for checking NEEDED entries)"
+          fi
+
+          # 显示文件大小
+          echo "=== libmpv.so size ==="
+          ls -lh "$ARTIFACT_DIR/libmpv.so"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -360,10 +393,9 @@ jobs:
           merge-multiple: false
 
       - name: Package all ABIs
-        # 将 4 个 ABI 的 .so 文件打包成一个 tar.gz
         run: |
           mkdir -p release/jniLibs
-          for arch in arm64-v8a armeabi-v7a x86_64 x86; do
+          for arch in arm64-v8a armeabi-v7a; do
             echo "=== Processing $arch ==="
             ARTIFACT_DIR="artifacts/libmpv-cavs-android-$arch"
             if [ -d "$ARTIFACT_DIR" ]; then
@@ -378,7 +410,7 @@ jobs:
 
           # 验证所有 ABI 都有 libmpv.so
           echo "=== Verifying all ABIs ==="
-          for arch in arm64-v8a armeabi-v7a x86_64 x86; do
+          for arch in arm64-v8a armeabi-v7a; do
             if [ ! -f "release/jniLibs/$arch/libmpv.so" ]; then
               echo "ERROR: libmpv.so missing for $arch"
               exit 1
@@ -387,14 +419,14 @@ jobs:
 
           # 打包
           cd release
-          tar czf libmpv-cavs-android.tar.gz jniLibs
-          ls -la libmpv-cavs-android.tar.gz
+          tar czf libmpv-cavs-android-static.tar.gz jniLibs
+          ls -lh libmpv-cavs-android-static.tar.gz
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
-          files: release/libmpv-cavs-android.tar.gz
+          files: release/libmpv-cavs-android-static.tar.gz
           fail_on_unmatched_files: true
           overwrite_files: true
         env:
