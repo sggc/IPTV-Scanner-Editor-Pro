@@ -62,6 +62,7 @@ fun PlayerSettingsPanel(viewModel: AppViewModel) {
     val playerCapabilities by viewModel.playerCapabilities.collectAsState()
     val currentVo by viewModel.currentVo.collectAsState()
     val currentHwdec by viewModel.currentHwdec.collectAsState()
+    val currentRtspTransport by viewModel.currentRtspTransport.collectAsState()
     val hdrMode by viewModel.hdrMode.collectAsState()
     val hardwareDecode by viewModel.hardwareDecode.collectAsState()
     val isMpvMode = playerType == PlayerType.MPV
@@ -397,6 +398,50 @@ fun PlayerSettingsPanel(viewModel: AppViewModel) {
                 )
 
                 Spacer(modifier = Modifier.height(20.dp))
+
+                // -----------------------------------------------------------------
+                // RTSP 传输协议（仅 MPV 模式）
+                // -----------------------------------------------------------------
+                if (isMpvMode) {
+                    SectionTitle("RTSP 传输协议")
+                    Spacer(modifier = Modifier.height(4.dp))
+                    SectionDesc("RTSP 流的传输方式。TCP 更稳定（防火墙穿透），UDP 延迟更低但可能丢包")
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = currentRtspTransport == "tcp",
+                            onClick = { viewModel.setRtspTransport("tcp") },
+                            label = { Text("TCP（推荐）") },
+                            modifier = Modifier.tvFocusBorder()
+                        )
+                        FilterChip(
+                            selected = currentRtspTransport == "udp",
+                            onClick = { viewModel.setRtspTransport("udp") },
+                            label = { Text("UDP（低延迟）") },
+                            modifier = Modifier.tvFocusBorder()
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    val rtspDesc = when (currentRtspTransport) {
+                        "tcp" -> "TCP 传输：RTSP over TCP，数据通过 TCP 通道传输。" +
+                            "更稳定，防火墙穿透好，适合网络不稳定的环境。延迟略高"
+                        "udp" -> "UDP 传输：RTSP over UDP，数据通过 UDP 通道传输。" +
+                            "延迟更低，但网络不稳定时可能丢包导致花屏。需要良好的网络环境"
+                        else -> "未知传输协议: $currentRtspTransport"
+                    }
+                    Text(
+                        text = rtspDesc,
+                        color = Color(0xFFB0BEC5),
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    )
+
+                    Spacer(modifier = Modifier.height(20.dp))
+                }
 
                 // -----------------------------------------------------------------
                 // 黑屏 fallback 状态

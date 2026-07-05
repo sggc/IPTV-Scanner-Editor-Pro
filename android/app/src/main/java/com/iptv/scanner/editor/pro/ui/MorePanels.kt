@@ -1648,6 +1648,7 @@ fun UpdateDialog(viewModel: AppViewModel) {
  * 退出确认对话框：按 BACK 键退出时提示选择退出方式。
  * - 进入画中画：继续在小窗口中观看
  * - 立即退出：直接退出应用
+ * - 打开设置：不退出，转而打开播放器设置面板
  * - 取消：继续使用
  */
 @Composable
@@ -1705,10 +1706,21 @@ fun ExitConfirmDialog(viewModel: AppViewModel) {
             }
         },
         dismissButton = {
-            TextButton(
-                onClick = { viewModel.dismissExitConfirm() },
-                modifier = Modifier.tvFocusBorder()
-            ) { Text("取消") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // 打开设置：不退出，转而打开播放器设置面板
+                TextButton(
+                    onClick = {
+                        viewModel.dismissExitConfirm()
+                        viewModel.togglePlayerSettings()
+                    },
+                    modifier = Modifier.tvFocusBorder()
+                ) { Text("打开设置") }
+                // 取消
+                TextButton(
+                    onClick = { viewModel.dismissExitConfirm() },
+                    modifier = Modifier.tvFocusBorder()
+                ) { Text("取消") }
+            }
         }
     )
 }

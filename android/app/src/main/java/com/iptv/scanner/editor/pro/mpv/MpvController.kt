@@ -330,13 +330,14 @@ class MpvController : MPVLib.EventObserver, Player {
                     MPVLib.setPropertyString("demuxer-readahead-secs", "120")
                     Log.i(TAG, "HLS options: readahead=120s")
                 }
-                // RTSP：使用 TCP 传输（避免 UDP 丢包）
+                // RTSP：根据用户设置的传输协议（tcp/udp）
                 u.startsWith("rtsp://") -> {
-                    MPVLib.setPropertyString("rtsp-transport", "tcp")
+                    val transport = UserPrefs.getInstance().getRtspTransport()
+                    MPVLib.setPropertyString("rtsp-transport", transport)
                     MPVLib.setPropertyString("cache", "yes")
                     MPVLib.setPropertyString("demuxer-lavf-format", "")
                     MPVLib.setPropertyString("demuxer-readahead-secs", "5")
-                    Log.i(TAG, "RTSP options: transport=tcp")
+                    Log.i(TAG, "RTSP options: transport=$transport")
                 }
                 // MPEG-TS：显式指定 demuxer，增大预读
                 u.endsWith(".ts") || u.startsWith("udp://") || "/rtp/" in u -> {
@@ -765,10 +766,17 @@ class MpvController : MPVLib.EventObserver, Player {
      * 返回 null 表示当前无文件播放。
      */
     override fun savePlaybackState(): Pair<String, Double>? {
-        val url = MPVLib.getPropertyString("path") ?: return null
-        if (url.isEmpty()) return null
-        val time = MPVLib.getPropertyDouble("time-pos") ?: 0.0
-        return url to time
+        return try {
+            val url = MPVLib.getPropertyString("path") ?: return null
+            if (url.isEmpty()) return null
+            val time = MPVLib.getPropertyDouble("time-pos") ?: 0.0
+            url to time
+        } catch (e: Throwable) {
+            // MPVLib 可能因原生库加载失败而抛出 NoClassDefFoundError/UnsatisfiedLinkError
+            // 此时 MPVView 未成功初始化，无状态可保存
+            Log.w(TAG, "savePlaybackState failed (MPVLib not initialized?): ${e.message}")
+            null
+        }
     }
 
     /**

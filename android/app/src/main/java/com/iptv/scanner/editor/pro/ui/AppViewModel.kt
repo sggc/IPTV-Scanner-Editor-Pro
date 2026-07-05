@@ -507,6 +507,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _currentHwdec = MutableStateFlow(userPrefs.getHwdec())
     val currentHwdec: StateFlow<String> = _currentHwdec.asStateFlow()
 
+    // RTSP 传输协议（tcp/udp），供 UI 显示和切换
+    private val _currentRtspTransport = MutableStateFlow(userPrefs.getRtspTransport())
+    val currentRtspTransport: StateFlow<String> = _currentRtspTransport.asStateFlow()
+
     /** 当前是否使用硬件解码（所有播放器内核通用，UI 通过 collectAsState 自动响应） */
     private val _hardwareDecode = MutableStateFlow(userPrefs.getHwdec() != "no")
     val hardwareDecode: StateFlow<Boolean> = _hardwareDecode.asStateFlow()
@@ -4340,6 +4344,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _currentHwdec.value = hwdec
         (_player.value as? MpvController)?.setVoAndHwdec(_currentVo.value, hwdec)
         showOsd("播放器设置", "hwdec=$hwdec")
+    }
+
+    /**
+     * 设置 RTSP 传输协议（tcp/udp）。
+     * 下次播放 RTSP 流时生效（运行时切换需重新加载当前文件）。
+     */
+    fun setRtspTransport(transport: String) {
+        userPrefs.setRtspTransport(transport)
+        _currentRtspTransport.value = transport
+        showOsd("播放器设置", "RTSP 传输: $transport")
     }
 
     /**

@@ -182,6 +182,13 @@ class UserPrefs private constructor() {
         prefs.edit().putString(KEY_HDR_MODE, mode).apply()
     }
 
+    /** 获取 RTSP 传输协议，默认 "tcp"（更稳定），可选 "udp"（更低延迟但可能丢包） */
+    fun getRtspTransport(): String = prefs.getString(KEY_RTSP_TRANSPORT, DEFAULT_RTSP_TRANSPORT) ?: DEFAULT_RTSP_TRANSPORT
+
+    fun setRtspTransport(transport: String) {
+        prefs.edit().putString(KEY_RTSP_TRANSPORT, transport).apply()
+    }
+
     /** 重置播放器设置为默认值（用户换设备或想重新探测时调用） */
     fun resetPlayerSettings() {
         prefs.edit()
@@ -190,6 +197,7 @@ class UserPrefs private constructor() {
             .remove(KEY_VO_FALLBACK)
             .remove(KEY_PLAYER_TYPE)
             .remove(KEY_HDR_MODE)
+            .remove(KEY_RTSP_TRANSPORT)
             .remove(KEY_IJK_TESTING)
             .apply()
     }
@@ -640,6 +648,8 @@ class UserPrefs private constructor() {
         private const val KEY_PLAYER_TYPE = "player_type"
         private const val KEY_HDR_MODE = "hdr_output_mode"
         private const val DEFAULT_HDR_MODE = "disable"
+        private const val KEY_RTSP_TRANSPORT = "rtsp_transport"
+        private const val DEFAULT_RTSP_TRANSPORT = "tcp"
         // 频道级播放器设置（per-channel override）
         private const val KEY_PER_CHANNEL_SETTINGS = "per_channel_player_settings"
         private const val KEY_CHANNEL_SETTINGS_PREFIX = "channel_settings_"
