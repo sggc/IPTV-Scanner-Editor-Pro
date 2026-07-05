@@ -1,7 +1,8 @@
-name: Build libmpv with CAVS/AVS2 support (Android, static, stripped)
+name: Build libmpv with CAVS/AVS2 support (Android, static, stripped, optimized)
 
 # Build libmpv for Android with CAVS (Guangdian) + AVS2 support
-# Changes: FFmpeg static linked + decoder stripped, output only libmpv.so
+# Optimized: static linked + decoder stripped + size optimized + llvm-strip
+# Output: single libmpv.so per arch
 
 on:
   workflow_dispatch:
@@ -123,8 +124,8 @@ jobs:
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
           # 4b. Shared -> static
           sed -i 's/--disable-static --enable-shared/--enable-static --disable-shared/' scripts/ffmpeg.sh
-          # 4c. Add --ar and --ranlib for static build (NDK only has llvm-ar, not *-ar)
-          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib/' scripts/ffmpeg.sh
+          # 4c. Add --ar, --ranlib, and size optimization flags for FFmpeg
+          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os --disable-postproc --disable-avdevice --disable-debug --disable-programs --disable-doc/' scripts/ffmpeg.sh
           # 4c. Decoder stripping: write block to temp file then insert with sed r
           cat > /tmp/decoders.txt << 'DECEOF'
           	--disable-decoders
@@ -228,8 +229,19 @@ jobs:
             find . -name "*.so" -ls | head -30
             exit 1
           fi
+          echo "=== Size before strip ==="
+          ls -lh "$MPV_SO"
+          # Strip debug symbols using NDK llvm-strip (biggest size reduction)
+          STRIP_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          if [ -f "$STRIP_TOOL" ]; then
+            "$STRIP_TOOL" --strip-all "$MPV_SO"
+            echo "=== Size after strip ==="
+            ls -lh "$MPV_SO"
+          else
+            echo "WARNING: llvm-strip not found at $STRIP_TOOL, skipping strip"
+          fi
           cp -L "$MPV_SO" "artifacts/${{ matrix.arch.name }}/"
-          echo "=== Size ==="
+          echo "=== Final size ==="
           ls -lh "artifacts/${{ matrix.arch.name }}/libmpv.so"
           echo "=== CAVS/AVS2 check ==="
           strings "artifacts/${{ matrix.arch.name }}/libmpv.so" | grep -iE "cavs|avs2|davs2|guangdian" | head -20 || echo "WARNING: no CAVS/AVS2"
