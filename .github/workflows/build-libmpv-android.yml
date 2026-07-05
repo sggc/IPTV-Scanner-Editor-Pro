@@ -125,7 +125,9 @@ jobs:
           # 4b. Shared -> static
           sed -i 's/--disable-static --enable-shared/--enable-static --disable-shared/' scripts/ffmpeg.sh
           # 4c. Add --ar, --ranlib, and size optimization flags for FFmpeg
-          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os --disable-postproc --disable-avdevice --disable-debug --disable-programs --disable-doc/' scripts/ffmpeg.sh
+          # Note: only add options that this FFmpeg version recognizes.
+          # mpv-android buildscripts already disable programs/doc/debug/etc.
+          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os/' scripts/ffmpeg.sh
           # 4c. Decoder stripping: write block to temp file then insert with sed r
           cat > /tmp/decoders.txt << 'DECEOF'
           	--disable-decoders
