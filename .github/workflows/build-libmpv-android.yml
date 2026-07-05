@@ -123,6 +123,8 @@ jobs:
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
           # 4b. Shared -> static
           sed -i 's/--disable-static --enable-shared/--enable-static --disable-shared/' scripts/ffmpeg.sh
+          # 4c. Add --ar and --ranlib for static build (NDK only has llvm-ar, not *-ar)
+          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib/' scripts/ffmpeg.sh
           # 4c. Decoder stripping: write block to temp file then insert with sed r
           cat > /tmp/decoders.txt << 'DECEOF'
           	--disable-decoders
