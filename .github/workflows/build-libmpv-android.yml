@@ -203,6 +203,9 @@ jobs:
                   '/* FORCE_SYNC_THREADPOOL - replaced by build script */' + nl +
                   '/* Synchronous implementation - no threads, no pthread_create */' + nl +
                   '' + nl +
+                  '#ifndef FPFX' + nl +
+                  '#define FPFX(x) davs2_##x' + nl +
+                  '#endif' + nl +
                   '#include "threadpool.h"' + nl +
                   '#include <stdlib.h>' + nl +
                   '#include <string.h>' + nl +
@@ -241,6 +244,28 @@ jobs:
               ok.append("threadpool.cc: REPLACED ENTIRE FILE with sync implementation")
           else:
               fail.append(f"NOT FOUND: {threadpool_cc}")
+
+          # ===== 1b. Patch threadpool.h: remove FPFX macro dependencies =====
+          # threadpool.h has macros like:
+          #   #define davs2_threadpool_init FPFX(threadpool_init)
+          # FPFX is defined in davs2.h which our threadpool.cc may not include.
+          # Remove these #define lines so function names are plain identifiers.
+          threadpool_h = "source/common/threadpool.h"
+          if os.path.exists(threadpool_h):
+              with open(threadpool_h, 'r', encoding='latin-1') as f:
+                  h_content = f.read()
+              h_orig = h_content
+              h_content = re.sub(r'#define\s+davs2_threadpool_\w+\s+FPFX\(\w+\)\s*\n', '', h_content)
+              if 'FPFX_REMOVED' not in h_content:
+                  h_content = '/* FPFX_REMOVED */\n' + h_content
+              if h_content != h_orig:
+                  with open(threadpool_h, 'w', encoding='latin-1') as f:
+                      f.write(h_content)
+                  ok.append("threadpool.h: removed FPFX macros + added marker")
+              else:
+                  ok.append("threadpool.h: already patched")
+          else:
+              fail.append(f"NOT FOUND: {threadpool_h}")
 
           # ===== 2. Patch davs2.cc: force param->threads=1 + NULL guards =====
           davs2_cc = "source/common/davs2.cc"
@@ -344,7 +369,8 @@ jobs:
 
           # Verify critical patches
           critical_checks = [
-              ('threadpool replaced', threadpool_cc, 'FORCE_SYNC_THREADPOOL'),
+              ('threadpool.cc replaced', threadpool_cc, 'FORCE_SYNC_THREADPOOL'),
+              ('threadpool.h patched', threadpool_h, 'FPFX_REMOVED'),
               ('param->threads forced', davs2_cc, 'FORCE_SINGLE_THREAD_IN_DAVS2'),
           ]
           all_critical = True
