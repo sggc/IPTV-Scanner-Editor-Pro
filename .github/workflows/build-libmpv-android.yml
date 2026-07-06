@@ -103,7 +103,15 @@ jobs:
             'fi' \
             'export CC="$CXX"' \
             'cd build/linux' \
+            '# Try --disable-thread first; fall back without it if unsupported' \
             './configure \' \
+            '	--host=$ndk_triple \' \
+            '	--prefix=/ \' \
+            '	--enable-shared \' \
+            '	--disable-static \' \
+            '	--enable-pic \' \
+            '	--disable-asm \' \
+            '	--disable-thread || ./configure \' \
             '	--host=$ndk_triple \' \
             '	--prefix=/ \' \
             '	--enable-shared \' \
@@ -170,7 +178,7 @@ jobs:
           echo "=== davs2 source check ==="
           ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 not found"; exit 1; }
 
-      - name: Patch davs2 source for NULL safety
+      - name: Patch davs2 source — disable threading + NULL safety
         run: |
           cd mpv-android/buildscripts
           DAVS2_DIR=$(find . -type d -name "davs2" | grep -v ".git" | head -1)
@@ -180,46 +188,106 @@ jobs:
           echo "=== davs2 source files ==="
           find source -name "*.cc" -o -name "*.c" | sort
 
-          # Use Python for reliable patching of davs2 source
-          python3 << 'PYEOF'
-          import os, glob
+          cat > /tmp/patch_davs2_source.py << 'SCRIPT_EOF'
+          import os, re, sys
 
-          # Patch davs2.cc: add NULL guards at API entry points
+          nl = '\n'
+          ok = []
+          fail = []
+
+          # ===== 1. Patch threadpool.cc: DISABLE thread pool creation entirely =====
+          # This is THE critical fix — prevents davs2 from creating ANY threads
+          threadpool_cc = "source/common/threadpool.cc"
+          if os.path.exists(threadpool_cc):
+              with open(threadpool_cc, 'r', encoding='latin-1') as f:
+                  content = f.read()
+              orig = content
+
+              if 'FORCE_DISABLE_THREADPOOL' not in content:
+                  patched = False
+                  # Try multiple patterns to find threadpool_create function
+                  patterns = [
+                      r'(\w+\s*\*+\s*threadpool_create\s*\([^)]*\)\s*)\{',
+                      r'(void\s*\*+\s*threadpool_create\s*\([^)]*\)\s*)\{',
+                      r'(threadpool_t\s*\*+\s*threadpool_create\s*\([^)]*\)\s*)\{',
+                      r'(\w+\s+\*?\s*\w*threadpool\w*create\w*\s*\([^)]*\)\s*)\{',
+                  ]
+                  for pat in patterns:
+                      match = re.search(pat, content)
+                      if match:
+                          brace_pos = match.end() - 1
+                          content = content[:brace_pos+1] + nl + '    return NULL; /* FORCE_DISABLE_THREADPOOL */' + nl + content[brace_pos+1:]
+                          patched = True
+                          ok.append("threadpool.cc: disabled threadpool_create")
+                          break
+                  if not patched:
+                      # Fallback: find any function containing both 'threadpool' and 'create'
+                      for match in re.finditer(r'([\w\s\*]+\([^)]*\)\s*)\{', content):
+                          func_text = match.group(1)
+                          if 'threadpool' in func_text.lower() and 'create' in func_text.lower():
+                              brace_pos = match.end() - 1
+                              content = content[:brace_pos+1] + nl + '    return NULL; /* FORCE_DISABLE_THREADPOOL */' + nl + content[brace_pos+1:]
+                              patched = True
+                              ok.append("threadpool.cc: disabled (fallback match)")
+                              break
+                  if not patched:
+                      fail.append("threadpool.cc: cannot find threadpool_create")
+              else:
+                  ok.append("threadpool.cc: already disabled")
+
+              if content != orig:
+                  with open(threadpool_cc, 'w', encoding='latin-1') as f:
+                      f.write(content)
+                  print(f"  Written: {threadpool_cc}")
+          else:
+              fail.append(f"NOT FOUND: {threadpool_cc}")
+
+          # ===== 2. Patch davs2.cc: force param->threads=1 + NULL guards =====
           davs2_cc = "source/common/davs2.cc"
           if os.path.exists(davs2_cc):
               with open(davs2_cc, 'r', encoding='latin-1') as f:
                   content = f.read()
               orig = content
 
-              # Add NULL guard after each API function's opening brace
-              # These are exact patterns from davs2 1.7 source
-              patches = [
-                  # davs2_decoder_send_packet
-                  ('int davs2_decoder_send_packet', '    if (!h || !pkt || !pkt->data || pkt->len <= 0) return DAVS2_ERROR;\n'),
-                  # davs2_decoder_recv_frame
-                  ('int davs2_decoder_recv_frame', '    if (!h) return DAVS2_ERROR;\n'),
-                  # davs2_decoder_flush
-                  ('int davs2_decoder_flush', '    if (!h) return DAVS2_ERROR;\n'),
-                  # davs2_decoder_close
-                  ('void davs2_decoder_close', '    if (!h) return;\n'),
-              ]
+              # 2a. Force param->threads = 1 in davs2_decoder_open
+              if 'FORCE_SINGLE_THREAD_IN_DAVS2' not in content:
+                  idx = content.find('davs2_decoder_open')
+                  if idx >= 0:
+                      brace_idx = content.find('{', idx)
+                      if brace_idx >= 0:
+                          insert_pos = brace_idx + 1
+                          force_line = nl + '    if (param) param->threads = 1; /* FORCE_SINGLE_THREAD_IN_DAVS2 */' + nl
+                          content = content[:insert_pos] + force_line + content[insert_pos:]
+                          ok.append("davs2.cc: force param->threads=1")
+                      else:
+                          fail.append("davs2.cc: no brace after davs2_decoder_open")
+                  else:
+                      fail.append("davs2.cc: davs2_decoder_open not found")
+              else:
+                  ok.append("davs2.cc: already forced param->threads=1")
 
-              for func_sig, guard_line in patches:
+              # 2b. NULL guards at API entry points
+              api_patches = [
+                  ('int davs2_decoder_send_packet', '    if (!h || !pkt || !pkt->data || pkt->len <= 0) return DAVS2_ERROR;' + nl),
+                  ('int davs2_decoder_recv_frame', '    if (!h) return DAVS2_ERROR;' + nl),
+                  ('int davs2_decoder_flush', '    if (!h) return DAVS2_ERROR;' + nl),
+                  ('void davs2_decoder_close', '    if (!h) return;' + nl),
+              ]
+              for func_sig, guard_line in api_patches:
                   if guard_line.strip() not in content:
-                      # Find the function and insert guard after opening brace
                       idx = content.find(func_sig)
                       if idx >= 0:
                           brace_idx = content.find('{', idx)
                           if brace_idx >= 0:
                               insert_pos = brace_idx + 1
-                              content = content[:insert_pos] + '\n' + guard_line + content[insert_pos:]
-                              print(f"  Patched: {func_sig}")
+                              content = content[:insert_pos] + nl + guard_line + content[insert_pos:]
+                              ok.append(f"davs2.cc: NULL guard for {func_sig}")
                       else:
-                          print(f"  NOT FOUND: {func_sig}")
+                          fail.append(f"davs2.cc: {func_sig} not found")
                   else:
-                      print(f"  Already patched: {func_sig}")
+                      ok.append(f"davs2.cc: {func_sig} already guarded")
 
-              # Protect destroy_dpb calls
+              # 2c. Protect destroy_dpb calls
               content = content.replace(
                   'destroy_dpb(mgr);',
                   'if (mgr && mgr->dpb != NULL) destroy_dpb(mgr);'
@@ -230,37 +298,75 @@ jobs:
                       f.write(content)
                   print(f"  Written: {davs2_cc}")
 
-          # Patch decoder.cc: add NULL guards
+          # ===== 3. Patch decoder.cc: NULL guards + thread pool safety =====
           decoder_cc = "source/common/decoder.cc"
           if os.path.exists(decoder_cc):
               with open(decoder_cc, 'r', encoding='latin-1') as f:
                   content = f.read()
               orig = content
 
+              # 3a. NULL guards
               for func_sig in ['void decoder_close', 'int decoder_decode_frame', 'int decoder_decode_nal']:
-                  guard = '    if (h == NULL) return -1;\n'
+                  guard = '    if (h == NULL) return -1;' + nl
                   if func_sig == 'void decoder_close':
-                      guard = '    if (h == NULL) return;\n'
+                      guard = '    if (h == NULL) return;' + nl
                   if guard.strip() not in content:
                       idx = content.find(func_sig)
                       if idx >= 0:
                           brace_idx = content.find('{', idx)
                           if brace_idx >= 0:
                               insert_pos = brace_idx + 1
-                              content = content[:insert_pos] + '\n' + guard + content[insert_pos:]
-                              print(f"  Patched: {func_sig}")
+                              content = content[:insert_pos] + nl + guard + content[insert_pos:]
+                              ok.append(f"decoder.cc: NULL guard for {func_sig}")
+
+              # 3b. Replace threadpool_create calls with NULL (belt-and-suspenders)
+              # This ensures even if threadpool.cc patch fails, decoder won't create threads
+              if 'FORCE_NULL_THREADPOOL' not in content:
+                  content = re.sub(
+                      r'(h->\w*threadpool\w*\s*=\s*)threadpool_create\s*\([^)]*\)\s*;',
+                      r'\1NULL; /* FORCE_NULL_THREADPOOL */',
+                      content
+                  )
+                  if 'FORCE_NULL_THREADPOOL' in content:
+                      ok.append("decoder.cc: threadpool_create calls replaced with NULL")
 
               if content != orig:
                   with open(decoder_cc, 'w', encoding='latin-1') as f:
                       f.write(content)
                   print(f"  Written: {decoder_cc}")
 
-          print("=== davs2 patch done ===")
-          PYEOF
+          # ===== Summary =====
+          print(nl + "=== DAVS2 SOURCE PATCH SUMMARY ===")
+          for p in ok:
+              print(f"  OK:   {p}")
+          for p in fail:
+              print(f"  FAIL: {p}")
+
+          # Verify critical patches
+          critical_checks = [
+              ('threadpool disabled', threadpool_cc, 'FORCE_DISABLE_THREADPOOL'),
+              ('param->threads forced', davs2_cc, 'FORCE_SINGLE_THREAD_IN_DAVS2'),
+          ]
+          all_critical = True
+          for name, path, marker in critical_checks:
+              if os.path.exists(path):
+                  with open(path, 'r', encoding='latin-1') as f:
+                      v = f.read()
+                  if marker in v:
+                      print(f"  VERIFIED: {name}")
+                  else:
+                      print(f"  NOT VERIFIED: {name}")
+                      all_critical = False
+
+          if not all_critical:
+              print("WARNING: Some critical patches not verified!")
+          print("=== DAVS2 SOURCE PATCH DONE ===")
+          SCRIPT_EOF
+
+          python3 /tmp/patch_davs2_source.py
 
           echo "=== davs2 patch verification ==="
-          grep -rn "if (!h" source/ 2>/dev/null | head -20
-          grep -rn "if (h == NULL)" source/ 2>/dev/null | head -20
+          grep -rn "FORCE_DISABLE_THREADPOOL\|FORCE_SINGLE_THREAD\|FORCE_NULL_THREADPOOL\|if (!h" source/ 2>/dev/null | head -30
 
       - name: Patch FFmpeg libdavs2.c wrapper (CRITICAL FIX)
         run: |
@@ -409,6 +515,41 @@ jobs:
           else:
               ok.append("4: Already applied or not needed")
 
+          # PATCH 5: Force avctx->thread_count = 1 in davs2_init (belt-and-suspenders)
+          # This ensures FFmpeg itself doesn't try to use multiple threads
+          if 'FORCE_AVCX_THREAD_COUNT_1' not in content:
+              # Find davs2_init function and add avctx->thread_count = 1 at the beginning
+              init_idx = content.find('davs2_init')
+              if init_idx >= 0:
+                  init_brace = content.find('{', init_idx)
+                  if init_brace >= 0:
+                      insert_pos = init_brace + 1
+                      thread_force = (
+                          nl + "    avctx->thread_count = 1; /* FORCE_AVCX_THREAD_COUNT_1 */" + nl
+                      )
+                      content = content[:insert_pos] + thread_force + content[insert_pos:]
+                      ok.append("5: Force avctx->thread_count=1 in davs2_init")
+                  else:
+                      fail.append("5: No brace after davs2_init")
+              else:
+                  # Try alternative function name
+                  for alt_name in ['ff_davs2_init', 'davs2_decoder_init']:
+                      alt_idx = content.find(alt_name)
+                      if alt_idx >= 0:
+                          alt_brace = content.find('{', alt_idx)
+                          if alt_brace >= 0:
+                              insert_pos = alt_brace + 1
+                              thread_force = (
+                                  nl + "    avctx->thread_count = 1; /* FORCE_AVCX_THREAD_COUNT_1 */" + nl
+                              )
+                              content = content[:insert_pos] + thread_force + content[insert_pos:]
+                              ok.append(f"5: Force avctx->thread_count=1 in {alt_name}")
+                              break
+                  else:
+                      fail.append("5: Cannot find davs2_init function")
+          else:
+              ok.append("5: Already applied")
+
           # Write
           if content != original:
               with open(file_path, 'w', encoding='latin-1') as f:
@@ -431,6 +572,7 @@ jobs:
               ('NULL decoder', 'NULL_DECODER_CHECK'),
               ('Error recovery', 'ERROR_RECOVERY'),
               ('Flush on send error', "can't read packet, flushing"),
+              ('Force thread_count', 'FORCE_AVCX_THREAD_COUNT_1'),
           ]
           all_ok = True
           for name, marker in checks:
@@ -446,6 +588,19 @@ jobs:
           SCRIPT_EOF
 
           python3 /tmp/patch_davs2.py
+
+          # Force recompilation of libdavs2.c (prevent stale .o cache)
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          if [ -z "$FFMPEG_DIR" ]; then
+            FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          fi
+          if [ -n "$FFMPEG_DIR" ] && [ -f "$FFMPEG_DIR/libavcodec/libdavs2.c" ]; then
+            touch "$FFMPEG_DIR/libavcodec/libdavs2.c"
+            echo "Touched libdavs2.c to force recompilation"
+          fi
 
       - name: Apply CAVS patches to FFmpeg
         run: |
