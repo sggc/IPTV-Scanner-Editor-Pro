@@ -80,53 +80,25 @@ jobs:
         run: |
           cd mpv-android/buildscripts
 
-          # === 1. depinfo.sh: add davs2 ===
-          sed -i '/^v_libxml2=/a v_davs2=1.7' include/depinfo.sh
-          sed -i '/^dep_dav1d=/a dep_davs2=()' include/depinfo.sh
-          sed -i 's/dep_ffmpeg=(mbedtls dav1d libxml2)/dep_ffmpeg=(mbedtls dav1d libxml2 davs2)/' include/depinfo.sh
+          # === 1. No davs2 dependency needed ===
+          # FFmpeg has a native AVS2 decoder (avs2.c) built-in since v4.3.
+          # We use that instead of the external libdavs2 which crashes on corrupt streams.
+          # No changes to depinfo.sh needed - davs2 is not a dependency anymore.
 
-          # === 2. download-deps.sh: add davs2 download ===
-          sed -i '/^\[ ! -d dav1d \] && git clone https:\/\/github.com\/videolan\/dav1d$/a # davs2\n[ ! -d davs2 ] \&\& git clone --depth 1 --branch 1.7 https:\/\/github.com\/pkuvcl\/davs2.git' include/download-deps.sh
+          # === 2. No davs2 download needed ===
+          # No changes to download-deps.sh needed.
 
-          # === 3. Create scripts/davs2.sh (dynamic build) ===
-          # Using printf to avoid heredoc indentation issues in YAML
-          printf '%s\n' \
-            '#!/bin/bash -e' \
-            '. ../../include/path.sh' \
-            'if [ "$1" == "build" ]; then' \
-            '	true' \
-            'elif [ "$1" == "clean" ]; then' \
-            '	rm -rf _build$ndk_suffix' \
-            '	exit 0' \
-            'else' \
-            '	exit 255' \
-            'fi' \
-            'export CC="$CXX"' \
-            'git fetch origin --depth 1 master:refs/remotes/origin/master' \
-            'cd build/linux' \
-            './configure \' \
-            '	--host=$ndk_triple \' \
-            '	--prefix=/ \' \
-            '	--enable-shared \' \
-            '	--disable-static \' \
-            '	--enable-pic \' \
-            '	--disable-asm' \
-            'make -j$cores lib-shared' \
-            'make DESTDIR="$prefix_dir" install-lib-shared' \
-            > scripts/davs2.sh
-          chmod +x scripts/davs2.sh
-
-          # === 4. Patch ffmpeg.sh ===
-          sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
+          # === 3. Patch ffmpeg.sh ===
+          # Only patch cc/ar/ranlib flags, do NOT add --enable-libdavs2
           sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os/' scripts/ffmpeg.sh
 
-          # === 4c. Decoder stripping via printf ===
+          # === 3b. Decoder list: use native avs2 decoder instead of libdavs2 ===
           printf '%s\n' \
             '	--disable-decoders' \
             '	--enable-decoder=h264,hevc,mpeg1video,mpeg2video,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3' \
             '	--enable-decoder=h263,h263i,h263p,flv,svq1,svq3,amv' \
             '	--enable-decoder=vp3,vp5,vp6,vp6a,vp6f,vp7,vp8,vp9,av1' \
-            '	--enable-decoder=cavs,libdav1d,libdavs2,dra,avs3' \
+            '	--enable-decoder=cavs,libdav1d,avs2,avs3' \
             '	--enable-decoder=vc1,vc1image,wmv1,wmv2,wmv3,wmv3image' \
             '	--enable-decoder=theora,dvvideo,rawvideo' \
             '	--enable-decoder=mjpeg,jpegls,png,prores,ffv1,huffyuv' \
@@ -146,40 +118,18 @@ jobs:
           sed -i '/--disable-{muxers,encoders,devices}/r /tmp/decoders.txt' scripts/ffmpeg.sh
           echo "=== ffmpeg.sh ==="
           grep -c "enable-decoder" scripts/ffmpeg.sh
+          echo "=== Verify: no libdavs2 ==="
+          grep -i "libdavs2" scripts/ffmpeg.sh || echo "OK: libdavs2 not found in ffmpeg.sh"
+          echo "=== Verify: native avs2 decoder enabled ==="
+          grep "enable-decoder=.*avs2" scripts/ffmpeg.sh
 
       - name: Download dependencies
         run: |
           cd mpv-android/buildscripts
           export IN_CI=1
           ./download.sh
-          echo "=== davs2 source ==="
-          ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 not found"; exit 1; }
-
-      - name: Patch davs2 for crash safety
-        run: |
-          cd mpv-android/buildscripts
-          DAVS2_DIR=$(find . -type d -name "davs2" | grep -v ".git" | head -1)
-          [ -d "$DAVS2_DIR/source" ] || { echo "ERROR: davs2 source not found"; exit 1; }
-          cd "$DAVS2_DIR"
-          # davs2 crashes (SIGSEGV) when destroy_dpb(mgr) is called from
-          # davs2_decoder_close with an incompletely initialized decoder.
-          # The DPB array (mgr->dpb) may be NULL if no frame was decoded.
-          # Also decoder_close(h) may access uninitialized fields.
-          # Fix: add null checks at the call sites in davs2.cc and decoder_close in decoder.cc.
-          # Note: davs2 source files are .cc (C++), not .c
-          DAVS2_CC="source/common/davs2.cc"
-          DECODER_CC="source/common/decoder.cc"
-          [ -f "$DAVS2_CC" ] || { echo "ERROR: $DAVS2_CC not found"; exit 1; }
-          # Patch 1: Guard destroy_dpb call in davs2_decoder_close
-          sed -i 's/^\(\s*\)destroy_dpb(mgr);/\1if (mgr->dpb != NULL) destroy_dpb(mgr);/' "$DAVS2_CC"
-          # Patch 2: Guard destroy_all_lists call (belt-and-suspenders)
-          # Patch 3: Add null check at start of decoder_close in decoder.cc
-          if [ -f "$DECODER_CC" ]; then
-            sed -i '/^void decoder_close(davs2_t \*h)/s/{/{\n    if (h == NULL) return;/' "$DECODER_CC"
-          fi
-          echo "=== davs2 patch verification ==="
-          grep -n "if (mgr->dpb" "$DAVS2_CC" || echo "WARNING: davs2.cc patch not found"
-          grep -n "if (h == NULL)" "$DECODER_CC" 2>/dev/null || echo "WARNING: decoder.cc patch not found"
+          echo "=== FFmpeg source ==="
+          ls -la deps/ffmpeg/libavcodec/avs2.c 2>/dev/null || ls -la sources/ffmpeg/libavcodec/avs2.c 2>/dev/null || { echo "WARNING: native avs2.c not found, checking..."; find . -name "avs2*" -path "*/libavcodec/*" | head -5; }
 
       - name: Apply CAVS patches to FFmpeg
         run: |
@@ -210,6 +160,9 @@ jobs:
             fi
           fi
           ls -la libavcodec/libcavs* libavcodec/dradec* 2>/dev/null || { echo "ERROR: CAVS patch failed"; exit 1; }
+
+          echo "=== Verify native AVS2 decoder exists ==="
+          ls -la libavcodec/avs2.c libavcodec/avs2_dec.c 2>/dev/null || echo "WARNING: native avs2 decoder files not found"
 
       - name: Build libmpv
         run: |
@@ -251,48 +204,22 @@ jobs:
             cp -L "$so" "artifacts/${{ matrix.arch.name }}/"
           done
 
-          if [ -f "$PREFIX_LIB/libdavs2.so" ]; then
-            echo "libdavs2.so collected"
-          else
-            echo "WARNING: libdavs2.so not found in $PREFIX_LIB"
-            find . -name "libdavs2.so" -ls 2>/dev/null || true
-          fi
-
-          # === Fix versioned SONAME in libdavs2.so ===
-          DAVS2_SO="artifacts/${{ matrix.arch.name }}/libdavs2.so"
-          AVCODEC_SO="artifacts/${{ matrix.arch.name }}/libavcodec.so"
-          if [ -f "$DAVS2_SO" ]; then
-            OLD_SONAME=$(patchelf --print-soname "$DAVS2_SO" 2>/dev/null || echo "")
-            echo "libdavs2.so current SONAME: '$OLD_SONAME'"
-            if [ "$OLD_SONAME" != "libdavs2.so" ]; then
-              patchelf --set-soname libdavs2.so "$DAVS2_SO"
-              echo "Patched libdavs2.so SONAME -> libdavs2.so"
-            fi
-          fi
-          if [ -f "$AVCODEC_SO" ]; then
-            NEEDED=$(patchelf --print-needed "$AVCODEC_SO" 2>/dev/null | grep davs2 || echo "")
-            echo "libavcodec.so davs2 NEEDED: '$NEEDED'"
-            if echo "$NEEDED" | grep -q "libdavs2.so.16"; then
-              patchelf --replace-needed libdavs2.so.16 libdavs2.so "$AVCODEC_SO"
-              echo "Patched libavcodec.so NEEDED: libdavs2.so.16 -> libdavs2.so"
-            fi
+          # Verify: no libdavs2.so should exist (we use native AVS2 decoder now)
+          if [ -f "artifacts/${{ matrix.arch.name }}/libdavs2.so" ]; then
+            echo "WARNING: libdavs2.so found - removing it (using native AVS2 decoder)"
+            rm -f "artifacts/${{ matrix.arch.name }}/libdavs2.so"
           fi
 
           echo "=== Final artifacts ==="
           ls -lh "artifacts/${{ matrix.arch.name }}/"
-          echo "=== SONAME/NEEDED verification ==="
-          for so in "artifacts/${{ matrix.arch.name }}"/*.so; do
-            base=$(basename "$so")
-            soname=$(patchelf --print-soname "$so" 2>/dev/null || echo "N/A")
-            needed=$(patchelf --print-needed "$so" 2>/dev/null | grep davs2 || echo "")
-            echo "  $base: SONAME=$soname  davs2_NEEDED=$needed"
-          done
           echo "=== CAVS/AVS2 check ==="
           for so in "artifacts/${{ matrix.arch.name }}"/*.so; do
             base=$(basename "$so")
             cavs=$(strings "$so" | grep -ciE "cavs|avs2|davs2" 2>/dev/null || echo 0)
             echo "  $base: CAVS/AVS2 strings = $cavs"
           done
+          echo "=== Verify native avs2 decoder in libavcodec.so ==="
+          strings "artifacts/${{ matrix.arch.name }}/libavcodec.so" | grep -i "avs2" | head -5 || echo "No avs2 strings found"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -326,6 +253,11 @@ jobs:
               cp "$DIR"/*.so "release/jniLibs/$arch/"
               echo "=== $arch ==="
               ls -la "release/jniLibs/$arch/"
+              # Verify no libdavs2.so
+              if [ -f "release/jniLibs/$arch/libdavs2.so" ]; then
+                echo "WARNING: removing stale libdavs2.so from $arch"
+                rm -f "release/jniLibs/$arch/libdavs2.so"
+              fi
             fi
           done
           for arch in arm64-v8a armeabi-v7a; do
