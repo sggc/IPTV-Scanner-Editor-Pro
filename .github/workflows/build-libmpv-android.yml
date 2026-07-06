@@ -86,7 +86,8 @@ jobs:
           sed -i 's/dep_ffmpeg=(mbedtls dav1d libxml2)/dep_ffmpeg=(mbedtls dav1d libxml2 davs2)/' include/depinfo.sh
 
           # === 2. download-deps.sh: add davs2 download ===
-          sed -i '/\[ ! -d dav1d \] && git clone/a [ ! -d davs2 ] && git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git' include/download-deps.sh
+          # Clone WITHOUT --depth 1 so version.sh can use git rev-list
+          sed -i '/\[ ! -d dav1d \] && git clone/a [ ! -d davs2 ] && git clone --branch 1.7 https://github.com/pkuvcl/davs2.git' include/download-deps.sh
 
           # === 3. Create scripts/davs2.sh ===
           printf '%s\n' \
@@ -111,6 +112,21 @@ jobs:
             '	--disable-asm' \
             'make -j$cores lib-shared' \
             'make DESTDIR="$prefix_dir" install-lib-shared' \
+            '# Fix .pc file: ensure Version field is correct (version.sh may fail with shallow clone)' \
+            'PC_FILE="$prefix_dir/lib/pkgconfig/davs2.pc"' \
+            'if [ -f "$PC_FILE" ]; then' \
+            '    echo "=== davs2.pc before fix ==="' \
+            '    cat "$PC_FILE"' \
+            '    if ! grep -q "^Version: 1" "$PC_FILE"; then' \
+            '        if grep -q "^Version:" "$PC_FILE"; then' \
+            '            sed -i "s/^Version:.*/Version: 1.7.0/" "$PC_FILE"' \
+            '        else' \
+            '            sed -i "/^Name:/a Version: 1.7.0" "$PC_FILE"' \
+            '        fi' \
+            '        echo "=== davs2.pc after fix ==="' \
+            '        cat "$PC_FILE"' \
+            '    fi' \
+            'fi' \
             'ls -la "$prefix_dir/lib/libdavs2.so"* "$prefix_dir/lib/pkgconfig/davs2.pc" 2>/dev/null || { echo "ERROR: davs2 build failed"; exit 1; }' \
             > scripts/davs2.sh
           chmod +x scripts/davs2.sh
