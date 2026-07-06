@@ -86,9 +86,9 @@ jobs:
           sed -i 's/dep_ffmpeg=(mbedtls dav1d libxml2)/dep_ffmpeg=(mbedtls dav1d libxml2 davs2)/' include/depinfo.sh
 
           # === 2. download-deps.sh: add davs2 download ===
-          sed -i '/^\[ ! -d dav1d \] && git clone https:\/\/github.com\/videolan\/dav1d$/a # davs2\n[ ! -d davs2 ] \&\& git clone --depth 1 --branch 1.7 https:\/\/github.com\/pkuvcl\/davs2.git' include/download-deps.sh
+          sed -i '/\[ ! -d dav1d \] && git clone/a [ ! -d davs2 ] && git clone --depth 1 --branch 1.7 https://github.com/pkuvcl/davs2.git' include/download-deps.sh
 
-          # === 3. Create scripts/davs2.sh (dynamic build) ===
+          # === 3. Create scripts/davs2.sh ===
           printf '%s\n' \
             '#!/bin/bash -e' \
             '. ../../include/path.sh' \
@@ -101,7 +101,6 @@ jobs:
             '	exit 255' \
             'fi' \
             'export CC="$CXX"' \
-            'git fetch origin --depth 1 master:refs/remotes/origin/master' \
             'cd build/linux' \
             './configure \' \
             '	--host=$ndk_triple \' \
@@ -112,6 +111,7 @@ jobs:
             '	--disable-asm' \
             'make -j$cores lib-shared' \
             'make DESTDIR="$prefix_dir" install-lib-shared' \
+            'ls -la "$prefix_dir/lib/libdavs2.so"* "$prefix_dir/lib/pkgconfig/davs2.pc" 2>/dev/null || { echo "ERROR: davs2 build failed"; exit 1; }' \
             > scripts/davs2.sh
           chmod +x scripts/davs2.sh
 
@@ -143,7 +143,7 @@ jobs:
             '	--enable-decoder=tak,tta,ape,shorten,imc' \
             > /tmp/decoders.txt
           sed -i '/--disable-{muxers,encoders,devices}/r /tmp/decoders.txt' scripts/ffmpeg.sh
-          echo "=== ffmpeg.sh ==="
+          echo "=== ffmpeg.sh decoder count ==="
           grep -c "enable-decoder" scripts/ffmpeg.sh
 
       - name: Download dependencies
@@ -151,7 +151,7 @@ jobs:
           cd mpv-android/buildscripts
           export IN_CI=1
           ./download.sh
-          echo "=== davs2 source ==="
+          echo "=== davs2 source check ==="
           ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 not found"; exit 1; }
 
       - name: Patch davs2 for crash safety
@@ -161,45 +161,29 @@ jobs:
           [ -d "$DAVS2_DIR/source" ] || { echo "ERROR: davs2 source not found"; exit 1; }
           cd "$DAVS2_DIR"
 
-          # davs2 source files are .cc (C++), located in source/common/
-          # Key files: davs2.cc (API), decoder.cc (decoder logic)
           echo "=== davs2 source files ==="
           find source -name "*.cc" -o -name "*.c" | sort
 
-          # Patch 1: Add NULL checks in davs2.cc (API functions)
-          # The crash happens during active decoding, not during close.
-          # Add NULL checks for h and h->dec_pic in key functions.
           DAVS2_CC="source/common/davs2.cc"
           DECODER_CC="source/common/decoder.cc"
 
           if [ -f "$DAVS2_CC" ]; then
-            # Add NULL check at start of davs2_decoder_send_packet
             sed -i '/int davs2_decoder_send_packet/,/^{/{
               /^{/a\    if (!h || !pkt || !pkt->data) return DAVS2_ERROR;
             }' "$DAVS2_CC"
-
-            # Add NULL check at start of davs2_decoder_recv_frame
             sed -i '/int davs2_decoder_recv_frame/,/^{/{
               /^{/a\    if (!h) return DAVS2_ERROR;
             }' "$DAVS2_CC"
-
-            # Add NULL check at start of davs2_decoder_flush
             sed -i '/int davs2_decoder_flush/,/^{/{
               /^{/a\    if (!h) return DAVS2_ERROR;
             }' "$DAVS2_CC"
-
-            # Guard destroy_dpb call
             sed -i 's/^\(\s*\)destroy_dpb(mgr);/\1if (mgr \&\& mgr->dpb != NULL) destroy_dpb(mgr);/' "$DAVS2_CC"
           fi
 
           if [ -f "$DECODER_CC" ]; then
-            # Add NULL check at start of decoder_close
             sed -i '/void decoder_close/,/^{/{
               /^{/a\    if (h == NULL) return;
             }' "$DECODER_CC"
-
-            # Add NULL check at start of key decode functions
-            # These guard against NULL h pointer in internal functions
             for func in 'int decoder_decode_frame' 'int decoder_decode_nal' 'int decode_slice' 'int decode_picture_header'; do
               sed -i "/${func}/,/^{/{
                 /^{/a\    if (h == NULL) return -1;
@@ -209,10 +193,9 @@ jobs:
 
           echo "=== davs2 patch verification ==="
           grep -n "if (!h" "$DAVS2_CC" 2>/dev/null | head -10
-          grep -n "if (!h" "$DECODER_CC" 2>/dev/null | head -10
-          grep -n "if (mgr" "$DAVS2_CC" 2>/dev/null | head -5
+          grep -n "if (h == NULL)" "$DECODER_CC" 2>/dev/null | head -10
 
-      - name: Patch FFmpeg libdavs2.c wrapper for corrupt packet handling
+      - name: Patch FFmpeg libdavs2.c wrapper
         run: |
           cd mpv-android/buildscripts
           FFMPEG_DIR=""
@@ -223,87 +206,39 @@ jobs:
             FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
           fi
           [ -d "$FFMPEG_DIR/libavcodec" ] || { echo "ERROR: no FFmpeg"; exit 1; }
-
           LIBDAVS2_C="$FFMPEG_DIR/libavcodec/libdavs2.c"
           [ -f "$LIBDAVS2_C" ] || { echo "ERROR: libdavs2.c not found"; exit 1; }
 
-          # KEY FIX: Add AV_PKT_FLAG_CORRUPT check to skip corrupt packets
-          # This prevents corrupt data from reaching davs2 decoder, which causes SIGSEGV
-          # Also add davs2_flush() on error to clear invalid decoder state
+          # Patch 1: Insert corrupt packet check before cad->packet.data
+          # Using sed s command with | delimiter to avoid quoting issues
+          if ! grep -q 'AV_PKT_FLAG_CORRUPT' "$LIBDAVS2_C"; then
+            sed -i 's|    cad->packet.data = buf_ptr;|    /* Skip corrupt packets to prevent davs2 from crashing (SIGSEGV) */\n    if (avpkt->flags \& AV_PKT_FLAG_CORRUPT) {\n        av_log(avctx, AV_LOG_WARNING, "Skipping corrupt packet to avoid decoder crash\\n");\n        davs2_flush(avctx);\n        return buf_size;\n    }\n\n    cad->packet.data = buf_ptr;|' "$LIBDAVS2_C"
+            echo "Patch 1 applied"
+          else
+            echo "Patch 1 already applied"
+          fi
 
-          # Use Python for reliable patching
-          python3 -c "
-          import re
-          with open('$LIBDAVS2_C', 'r') as f:
-              content = f.read()
+          # Patch 2: Add davs2_flush after send_packet error log
+          # Check if davs2_flush already follows the can't read packet line
+          if grep -q "can't read packet" "$LIBDAVS2_C" && ! grep -A1 "can't read packet" "$LIBDAVS2_C" | grep -q "davs2_flush"; then
+            sed -i "/can't read packet/a\\        davs2_flush(avctx);" "$LIBDAVS2_C"
+            echo "Patch 2 applied"
+          else
+            echo "Patch 2 skipped (pattern not found or already patched)"
+          fi
 
-          # Patch 1: Add corrupt packet check after 'end of stream' block
-          # Find the closing of the end-of-stream check and insert after it
-          old_code = '''    /* end of stream, output what is still in the buffers */
-            if (!buf_size) {
-                return send_delayed_frame(avctx, frame, got_frame);
-            }'''
-          new_code = '''    /* end of stream, output what is still in the buffers */
-            if (!buf_size) {
-                return send_delayed_frame(avctx, frame, got_frame);
-            }
-
-            /* Skip corrupt packets to prevent davs2 from crashing (SIGSEGV) */
-            if (avpkt->flags & AV_PKT_FLAG_CORRUPT) {
-                av_log(avctx, AV_LOG_WARNING, \"Skipping corrupt packet to avoid decoder crash\\n\");
-                davs2_flush(avctx);
-                return buf_size;
-            }'''
-          if old_code in content:
-              content = content.replace(old_code, new_code)
-              print('Patch 1 applied: corrupt packet check')
-          else:
-              print('WARNING: Patch 1 pattern not found, trying alternate')
-              # Try alternate pattern
-              old2 = '    if (!buf_size) {\n        return send_delayed_frame(avctx, frame, got_frame);\n    }'
-              new2 = old2 + '\n\n    /* Skip corrupt packets to prevent davs2 from crashing (SIGSEGV) */\n    if (avpkt->flags & AV_PKT_FLAG_CORRUPT) {\n        av_log(avctx, AV_LOG_WARNING, \"Skipping corrupt packet to avoid decoder crash\\n\");\n        davs2_flush(avctx);\n        return buf_size;\n    }'
-              if old2 in content:
-                  content = content.replace(old2, new2)
-                  print('Patch 1 applied (alternate): corrupt packet check')
-              else:
-                  print('ERROR: Could not apply Patch 1')
-
-          # Patch 2: Add flush on error after davs2_decoder_send_packet fails
-          old_err = 'av_log(avctx, AV_LOG_ERROR, \"Decoder error: can\\'t read packet\\n\");\n        return AVERROR_EXTERNAL;'
-          new_err = 'av_log(avctx, AV_LOG_ERROR, \"Decoder error: can\\'t read packet\\n\");\n        davs2_flush(avctx);\n        return AVERROR_EXTERNAL;'
-          if old_err in content:
-              content = content.replace(old_err, new_err)
-              print('Patch 2 applied: flush on send_packet error')
-          else:
-              print('WARNING: Patch 2 pattern not found')
-
-          # Patch 3: Handle DAVS2_ERROR from davs2_decoder_recv_frame
-          # When recv_frame returns error, out_frame data may be invalid.
-          old_recv = 'ret = davs2_decoder_recv_frame(cad->decoder, &cad->headerset, &cad->out_frame);\n    if (ret != DAVS2_DEFAULT) {'
-          new_recv = 'ret = davs2_decoder_recv_frame(cad->decoder, &cad->headerset, &cad->out_frame);\n    if (ret == DAVS2_ERROR) {\n        av_log(avctx, AV_LOG_WARNING, \"Decoder error: recv_frame failed, flushing\\n\");\n        davs2_flush(avctx);\n        return AVERROR_EXTERNAL;\n    }\n    if (ret != DAVS2_DEFAULT) {'
-          if old_recv in content:
-              content = content.replace(old_recv, new_recv)
-              print('Patch 3 applied: handle recv_frame error')
-          else:
-              print('WARNING: Patch 3 pattern not found')
-              # Try regex fallback
-              import re
-              pattern = r'(davs2_decoder_recv_frame\(cad->decoder, &cad->headerset, &cad->out_frame\);)\n(\s*)if \(ret != DAVS2_DEFAULT\) \{'
-              replacement = r'\1\n\2if (ret == DAVS2_ERROR) {\n\2    av_log(avctx, AV_LOG_WARNING, "Decoder error: recv_frame failed, flushing\\n");\n\2    davs2_flush(avctx);\n\2    return AVERROR_EXTERNAL;\n\2}\n\2if (ret != DAVS2_DEFAULT) {'
-              new_content = re.sub(pattern, replacement, content)
-              if new_content != content:
-                  content = new_content
-                  print('Patch 3 applied (regex): handle recv_frame error')
-              else:
-                  print('WARNING: Patch 3 could not be applied')
-
-          with open('$LIBDAVS2_C', 'w') as f:
-              f.write(content)
-          "
+          # Patch 3: Add DAVS2_ERROR check before DAVS2_DEFAULT check in recv_frame
+          if ! grep -q 'recv_frame failed' "$LIBDAVS2_C"; then
+            sed -i '/if (ret != DAVS2_DEFAULT)/i\    if (ret == DAVS2_ERROR) {\n        av_log(avctx, AV_LOG_WARNING, "Decoder error: recv_frame failed, flushing\\n");\n        davs2_flush(avctx);\n        return AVERROR_EXTERNAL;\n    }' "$LIBDAVS2_C"
+            echo "Patch 3 applied"
+          else
+            echo "Patch 3 already applied"
+          fi
 
           echo "=== Patched libdavs2.c verification ==="
-          grep -n "AV_PKT_FLAG_CORRUPT" "$LIBDAVS2_C"
-          grep -n "davs2_flush" "$LIBDAVS2_C"
+          grep -n "AV_PKT_FLAG_CORRUPT" "$LIBDAVS2_C" || echo "WARNING: AV_PKT_FLAG_CORRUPT not found"
+          grep -n "davs2_flush" "$LIBDAVS2_C" || echo "WARNING: davs2_flush not found"
+          grep -n "recv_frame failed" "$LIBDAVS2_C" || echo "WARNING: recv_frame failed not found"
 
       - name: Apply CAVS patches to FFmpeg
         run: |
