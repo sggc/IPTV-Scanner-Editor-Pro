@@ -187,50 +187,58 @@ jobs:
           ok = []
           fail = []
 
-          # ===== 1. Patch threadpool.cc: DISABLE thread pool creation entirely =====
-          # This is THE critical fix — prevents davs2 from creating ANY threads
+          # ===== 1. REPLACE ENTIRE threadpool.cc with synchronous implementation =====
+          # THE critical fix — replaces all threadpool functions with synchronous
+          # versions that execute work in the calling thread.
+          # No pthread_create, no worker threads, no race conditions.
+          # API from threadpool.h:
+          #   int  davs2_threadpool_init(p_pool, threads, init_func, init_arg1, init_arg2)
+          #   void davs2_threadpool_run(pool, func, arg1, arg2, wait_sign)
+          #   int  davs2_threadpool_is_free(pool)
+          #   void *davs2_threadpool_wait(pool, arg1, arg2)
+          #   void davs2_threadpool_delete(pool)
           threadpool_cc = "source/common/threadpool.cc"
           if os.path.exists(threadpool_cc):
-              with open(threadpool_cc, 'r', encoding='latin-1') as f:
-                  content = f.read()
-              orig = content
-
-              if 'FORCE_DISABLE_THREADPOOL' not in content:
-                  patched = False
-                  # Try multiple patterns to find threadpool_create function
-                  patterns = [
-                      r'(\w+\s*\*+\s*threadpool_create\s*\([^)]*\)\s*)\{',
-                      r'(void\s*\*+\s*threadpool_create\s*\([^)]*\)\s*)\{',
-                      r'(threadpool_t\s*\*+\s*threadpool_create\s*\([^)]*\)\s*)\{',
-                      r'(\w+\s+\*?\s*\w*threadpool\w*create\w*\s*\([^)]*\)\s*)\{',
-                  ]
-                  for pat in patterns:
-                      match = re.search(pat, content)
-                      if match:
-                          brace_pos = match.end() - 1
-                          content = content[:brace_pos+1] + nl + '    return NULL; /* FORCE_DISABLE_THREADPOOL */' + nl + content[brace_pos+1:]
-                          patched = True
-                          ok.append("threadpool.cc: disabled threadpool_create")
-                          break
-                  if not patched:
-                      # Fallback: find any function containing both 'threadpool' and 'create'
-                      for match in re.finditer(r'([\w\s\*]+\([^)]*\)\s*)\{', content):
-                          func_text = match.group(1)
-                          if 'threadpool' in func_text.lower() and 'create' in func_text.lower():
-                              brace_pos = match.end() - 1
-                              content = content[:brace_pos+1] + nl + '    return NULL; /* FORCE_DISABLE_THREADPOOL */' + nl + content[brace_pos+1:]
-                              patched = True
-                              ok.append("threadpool.cc: disabled (fallback match)")
-                              break
-                  if not patched:
-                      fail.append("threadpool.cc: cannot find threadpool_create")
-              else:
-                  ok.append("threadpool.cc: already disabled")
-
-              if content != orig:
-                  with open(threadpool_cc, 'w', encoding='latin-1') as f:
-                      f.write(content)
-                  print(f"  Written: {threadpool_cc}")
+              sync_impl = (
+                  '/* FORCE_SYNC_THREADPOOL - replaced by build script */' + nl +
+                  '/* Synchronous implementation — no threads, no pthread_create */' + nl +
+                  '' + nl +
+                  '#include "threadpool.h"' + nl +
+                  '#include <stdlib.h>' + nl +
+                  '#include <string.h>' + nl +
+                  '' + nl +
+                  'struct davs2_threadpool_t { int dummy; };' + nl +
+                  '' + nl +
+                  'int davs2_threadpool_init(davs2_threadpool_t **p_pool, int threads,' + nl +
+                  '                           davs2_threadpool_func_t init_func,' + nl +
+                  '                           void *init_arg1, int init_arg2) {' + nl +
+                  '    *p_pool = (davs2_threadpool_t *)calloc(1, sizeof(davs2_threadpool_t));' + nl +
+                  '    if (!*p_pool) return -1;' + nl +
+                  '    if (init_func) init_func(init_arg1, init_arg2);' + nl +
+                  '    return 0;' + nl +
+                  '}' + nl +
+                  '' + nl +
+                  'void davs2_threadpool_run(davs2_threadpool_t *pool,' + nl +
+                  '                           davs2_threadpool_func_t func,' + nl +
+                  '                           void *arg1, int arg2, int wait_sign) {' + nl +
+                  '    if (func) func(arg1, arg2);' + nl +
+                  '}' + nl +
+                  '' + nl +
+                  'int davs2_threadpool_is_free(davs2_threadpool_t *pool) {' + nl +
+                  '    return 1;' + nl +
+                  '}' + nl +
+                  '' + nl +
+                  'void *davs2_threadpool_wait(davs2_threadpool_t *pool, void *arg1, int arg2) {' + nl +
+                  '    return NULL;' + nl +
+                  '}' + nl +
+                  '' + nl +
+                  'void davs2_threadpool_delete(davs2_threadpool_t *pool) {' + nl +
+                  '    if (pool) free(pool);' + nl +
+                  '}' + nl
+              )
+              with open(threadpool_cc, 'w', encoding='latin-1') as f:
+                  f.write(sync_impl)
+              ok.append("threadpool.cc: REPLACED ENTIRE FILE with sync implementation")
           else:
               fail.append(f"NOT FOUND: {threadpool_cc}")
 
@@ -336,7 +344,7 @@ jobs:
 
           # Verify critical patches
           critical_checks = [
-              ('threadpool disabled', threadpool_cc, 'FORCE_DISABLE_THREADPOOL'),
+              ('threadpool replaced', threadpool_cc, 'FORCE_SYNC_THREADPOOL'),
               ('param->threads forced', davs2_cc, 'FORCE_SINGLE_THREAD_IN_DAVS2'),
           ]
           all_critical = True
@@ -358,7 +366,7 @@ jobs:
           python3 /tmp/patch_davs2_source.py
 
           echo "=== davs2 patch verification ==="
-          grep -rn "FORCE_DISABLE_THREADPOOL\|FORCE_SINGLE_THREAD\|FORCE_NULL_THREADPOOL\|if (!h" source/ 2>/dev/null | head -30
+          grep -rn "FORCE_SYNC_THREADPOOL\|FORCE_SINGLE_THREAD\|FORCE_NULL_THREADPOOL\|if (!h" source/ 2>/dev/null | head -30
 
       - name: Patch FFmpeg libdavs2.c wrapper (CRITICAL FIX)
         run: |
