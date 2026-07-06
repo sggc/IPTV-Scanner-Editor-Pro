@@ -381,25 +381,31 @@ jobs:
               fail.append("3: Cannot find send error block")
 
           # PATCH 4: recv_frame error recovery
+          # IMPORTANT: Do NOT use re.sub for replacement because it processes
+          # escape sequences in the replacement string, turning \\n into a real
+          # newline instead of the literal \n needed for C code.
+          # Instead, use re.search to find the pattern, then str.replace to insert.
           if 'ERROR_RECOVERY' not in content and 'davs2_decoder_recv_frame' in content:
-              recv_repl = (
-                  "\\1" + nl +
-                  "    /* ERROR_RECOVERY */" + nl +
-                  "    if (ret == DAVS2_ERROR) {" + nl +
-                  '        av_log(avctx, AV_LOG_WARNING, "davs2 recv_frame error, flushing\\n");' + nl +
-                  "        davs2_decoder_flush(cad->decoder, &cad->headerset, &cad->out_frame);" + nl +
-                  "        *got_frame = 0;" + nl +
-                  "        return buf_size;" + nl +
-                  "    }"
-              )
-              content = re.sub(
-                  r'(ret\s*=\s*davs2_decoder_recv_frame\([^)]+\)\s*;)',
-                  recv_repl, content, count=1
-              )
-              if 'ERROR_RECOVERY' in content:
-                  ok.append("4: recv_frame error recovery")
+              pattern = re.compile(r'ret\s*=\s*davs2_decoder_recv_frame\([^)]+\)\s*;')
+              match = pattern.search(content)
+              if match:
+                  matched_text = match.group(0)
+                  recovery_block = (
+                      "\n    /* ERROR_RECOVERY */" + nl +
+                      "    if (ret == DAVS2_ERROR) {" + nl +
+                      '        av_log(avctx, AV_LOG_WARNING, "davs2 recv_frame error, flushing\\n");' + nl +
+                      "        davs2_decoder_flush(cad->decoder, &cad->headerset, &cad->out_frame);" + nl +
+                      "        *got_frame = 0;" + nl +
+                      "        return buf_size;" + nl +
+                      "    }"
+                  )
+                  content = content.replace(matched_text, matched_text + recovery_block, 1)
+                  if 'ERROR_RECOVERY' in content:
+                      ok.append("4: recv_frame error recovery")
+                  else:
+                      fail.append("4: Cannot patch recv_frame")
               else:
-                  fail.append("4: Cannot patch recv_frame")
+                  fail.append("4: Cannot find recv_frame pattern")
           else:
               ok.append("4: Already applied or not needed")
 
