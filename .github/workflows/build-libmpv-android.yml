@@ -103,15 +103,7 @@ jobs:
             'fi' \
             'export CC="$CXX"' \
             'cd build/linux' \
-            '# Try --disable-thread first; fall back without it if unsupported' \
             './configure \' \
-            '	--host=$ndk_triple \' \
-            '	--prefix=/ \' \
-            '	--enable-shared \' \
-            '	--disable-static \' \
-            '	--enable-pic \' \
-            '	--disable-asm \' \
-            '	--disable-thread || ./configure \' \
             '	--host=$ndk_triple \' \
             '	--prefix=/ \' \
             '	--enable-shared \' \
