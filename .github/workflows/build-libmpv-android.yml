@@ -201,7 +201,7 @@ jobs:
           if os.path.exists(threadpool_cc):
               sync_impl = (
                   '/* FORCE_SYNC_THREADPOOL - replaced by build script */' + nl +
-                  '/* Synchronous implementation — no threads, no pthread_create */' + nl +
+                  '/* Synchronous implementation - no threads, no pthread_create */' + nl +
                   '' + nl +
                   '#include "threadpool.h"' + nl +
                   '#include <stdlib.h>' + nl +
