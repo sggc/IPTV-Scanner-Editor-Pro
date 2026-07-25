@@ -805,7 +805,7 @@ jobs:
           NM_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           if [ -f "$NM_TOOL" ]; then
             echo "--- Dynamic symbols ---"
-            "$NM_TOOL" -D av3a-libs/libavs3a_decoder.so 2>/dev/null | grep -i "avs3\|av3a\|parse_header\|decode" || echo "(no matching symbols)"
+            "$NM_TOOL" -D av3a-libs/libavs3a_decoder.so 2>/dev/null | grep -iE "Avs3(Alloc|Decode|Destroy|Parse)" || echo "(no matching symbols)"
             echo "--- All exported symbols ---"
             "$NM_TOOL" -D av3a-libs/libavs3a_decoder.so 2>/dev/null | head -50
           else
