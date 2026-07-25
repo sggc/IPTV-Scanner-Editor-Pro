@@ -658,12 +658,233 @@ jobs:
           fi
           ls -la libavcodec/libcavs* libavcodec/dradec* 2>/dev/null || { echo "ERROR: CAVS patch failed"; exit 1; }
 
+      - name: Build AV3A decoder static library and patch FFmpeg
+        run: |
+          cd mpv-android/buildscripts
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          if [ -z "$FFMPEG_DIR" ]; then
+            FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          fi
+          [ -d "$FFMPEG_DIR/libavcodec" ] || { echo "ERROR: no FFmpeg"; exit 1; }
+
+          echo "=== Step 1: Clone ijkplayer-av3a for AV3A decoder source ==="
+          cd "$GITHUB_WORKSPACE"
+          [ -d ijkplayer-av3a ] || git clone --depth 1 https://github.com/wuxianlin/ijkplayer-av3a.git ijkplayer-av3a
+          AV3A_SRC_DIR=$(find ijkplayer-av3a -name "avs3_decoder_interface.h" -exec dirname {} \; 2>/dev/null | head -1)
+          if [ -z "$AV3A_SRC_DIR" ]; then
+            echo "WARNING: avs3_decoder_interface.h not found in ijkplayer-av3a, skipping AV3A support"
+            exit 0
+          fi
+          echo "Found AV3A decoder source at: $AV3A_SRC_DIR"
+          ls -la "$AV3A_SRC_DIR/"
+
+          echo "=== Step 2: Build AV3A decoder as static library ==="
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p av3a-build && cd av3a-build
+          AV3A_SRC_ABS="$GITHUB_WORKSPACE/$AV3A_SRC_DIR"
+          # Collect all C/C++ source files from the decoder directory
+          AV3A_SOURCES=$(find "$AV3A_SRC_ABS" -maxdepth 1 \( -name "*.c" -o -name "*.cpp" \) | sort)
+          echo "AV3A source files:"
+          echo "$AV3A_SOURCES"
+          if [ -z "$AV3A_SOURCES" ]; then
+            echo "WARNING: No AV3A source files found, skipping AV3A support"
+            exit 0
+          fi
+
+          # Determine NDK toolchain paths
+          NDK_TRIPLE=""
+          case "${{ matrix.arch.name }}" in
+            arm64-v8a)    NDK_TRIPLE="aarch64-linux-android" ;;
+            armeabi-v7a)  NDK_TRIPLE="armv7a-linux-androideabi" ;;
+          esac
+          NDK_API_LEVEL=21
+          CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${NDK_TRIPLE}${NDK_API_LEVEL}-clang"
+          CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${NDK_TRIPLE}${NDK_API_LEVEL}-clang++"
+          AR="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          RANLIB="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib"
+
+          echo "CC=$CC"
+          echo "CXX=$CXX"
+
+          # Compile each source file
+          OBJ_FILES=""
+          for src in $AV3A_SOURCES; do
+            obj=$(basename "${src%.*}").o
+            echo "Compiling $(basename $src)..."
+            if [[ "$src" == *.cpp ]]; then
+              "$CXX" -c -O2 -fPIC -fno-exceptions -fno-rtti \
+                -I"$AV3A_SRC_ABS" \
+                -o "$obj" "$src" 2>&1 || { echo "WARNING: Failed to compile $(basename $src), skipping AV3A"; exit 0; }
+            else
+              "$CC" -c -O2 -fPIC \
+                -I"$AV3A_SRC_ABS" \
+                -o "$obj" "$src" 2>&1 || { echo "WARNING: Failed to compile $(basename $src), skipping AV3A"; exit 0; }
+            fi
+            OBJ_FILES="$OBJ_FILES $obj"
+          done
+
+          # Create static library
+          "$AR" rcs libav3a_decoder.a $OBJ_FILES
+          "$RANLIB" libav3a_decoder.a
+          echo "=== AV3A static library built ==="
+          ls -lh libav3a_decoder.a
+
+          # Install to prefix
+          AV3A_INSTALL_DIR="$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix/${{ matrix.arch.buildall_arg }}"
+          mkdir -p "$AV3A_INSTALL_DIR/include" "$AV3A_INSTALL_DIR/lib"
+          cp "$AV3A_SRC_ABS/avs3_decoder_interface.h" "$AV3A_INSTALL_DIR/include/"
+          cp libav3a_decoder.a "$AV3A_INSTALL_DIR/lib/"
+          echo "=== AV3A library installed to prefix ==="
+
+          echo "=== Step 3: Patch FFmpeg to add AV3A codec support ==="
+          cd "$GITHUB_WORKSPACE/mpv-android/buildscripts"
+          FFMPEG_ABS=$(cd "$FFMPEG_DIR" && pwd)
+          echo "FFmpeg dir: $FFMPEG_ABS"
+
+          # 3a. Write av3a_dec.c (FFmpeg AVCodec wrapper)
+          cp "$GITHUB_WORKSPACE/av3a_dec.c" "$FFMPEG_ABS/libavcodec/av3a_dec.c"
+          echo "Copied av3a_dec.c to libavcodec/"
+
+          # 3b. Add AV_CODEC_ID_AV3A to codec_id.h
+          CODEC_ID_H="$FFMPEG_ABS/libavcodec/codec_id.h"
+          if ! grep -q "AV_CODEC_ID_AV3A" "$CODEC_ID_H"; then
+            if grep -q "AV_CODEC_ID_DRA" "$CODEC_ID_H"; then
+              sed -i '/AV_CODEC_ID_DRA/a\    AV_CODEC_ID_AV3A,' "$CODEC_ID_H"
+            elif grep -q 'AV_CODEC_ID_AHX,' "$CODEC_ID_H"; then
+              sed -i '/AV_CODEC_ID_AHX,/a\    AV_CODEC_ID_AV3A,' "$CODEC_ID_H"
+            else
+              echo "WARNING: Cannot find insertion point in codec_id.h, adding at end of audio section"
+              sed -i '/AV_CODEC_ID_G728,/i\    AV_CODEC_ID_AV3A,' "$CODEC_ID_H"
+            fi
+            echo "Added AV_CODEC_ID_AV3A to codec_id.h"
+          else
+            echo "AV_CODEC_ID_AV3A already in codec_id.h"
+          fi
+          grep -n "AV_CODEC_ID_AV3A" "$CODEC_ID_H" || { echo "ERROR: Failed to add AV_CODEC_ID_AV3A"; exit 1; }
+
+          # 3c. Register decoder in allcodecs.c
+          ALLCODECS_C="$FFMPEG_ABS/libavcodec/allcodecs.c"
+          if ! grep -q "ff_av3a_decoder" "$ALLCODECS_C"; then
+            # Add extern declaration near other audio decoder externs
+            sed -i '/extern const FFCodec ff_aac_decoder;/a extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
+            # Add to codec list (after aac decoder entry)
+            sed -i '/ff_aac_decoder/i\    &ff_av3a_decoder,' "$ALLCODECS_C"
+            echo "Registered ff_av3a_decoder in allcodecs.c"
+          else
+            echo "ff_av3a_decoder already registered in allcodecs.c"
+          fi
+          grep -n "av3a" "$ALLCODECS_C"
+
+          # 3d. Add to Makefile
+          MAKEFILE="$FFMPEG_ABS/libavcodec/Makefile"
+          if ! grep -q "av3a_dec" "$MAKEFILE"; then
+            echo "OBJS-\$(CONFIG_AV3A_DECODER)            += av3a_dec.o" >> "$MAKEFILE"
+            echo "Added av3a_dec.o to Makefile"
+          fi
+          grep "av3a" "$MAKEFILE"
+
+          # 3e. Add FourCC tag mapping for MPEG-TS demuxer
+          # The MPEG-TS demuxer resolves codec tags via ff_codec_wav_tags in libavformat/riff.c
+          # AV3A FourCC = 'a','v','3','a' = 0x61337661
+          RIFF_C="$FFMPEG_ABS/libavformat/riff.c"
+          if [ -f "$RIFF_C" ] && ! grep -q "AV_CODEC_ID_AV3A" "$RIFF_C"; then
+            # Use hex value directly to avoid quoting issues with MKTAG macro
+            perl -i -pe 's/(\{ AV_CODEC_ID_PCM_S16LE,)/    { AV_CODEC_ID_AV3A,         0x61337661 },\n$1/' "$RIFF_C"
+            echo "Added AV3A FourCC tag to riff.c"
+            grep "AV3A" "$RIFF_C"
+          elif [ -f "$RIFF_C" ]; then
+            echo "AV3A tag already in riff.c"
+          fi
+          # Also try mpegts.c in case the tag is resolved there
+          MPEGTS_C="$FFMPEG_ABS/libavformat/mpegts.c"
+          if [ -f "$MPEGTS_C" ]; then
+            grep -c "av3a\|AV3A" "$MPEGTS_C" || echo "Note: AV3A not explicitly in mpegts.c (will use riff.c tags)"
+          fi
+
+          # 3f. Add codec descriptor
+          CODEC_DESC_C="$FFMPEG_ABS/libavcodec/codec_desc.c"
+          if [ -f "$CODEC_DESC_C" ] && ! grep -q "AV_CODEC_ID_AV3A" "$CODEC_DESC_C"; then
+            # Add codec descriptor before the sentinel entry
+            sed -i '/AV_CODEC_ID_NONE,/i\    { AV_CODEC_ID_AV3A, AV_CODEC_PROP_LOSSY, "av3a", "AVS3-P3 Audio Vivid (AV3A)", 0 },' "$CODEC_DESC_C" 2>/dev/null || true
+            echo "Added AV3A codec descriptor"
+          fi
+
+          echo "=== Step 4: Update ffmpeg.sh to enable AV3A decoder ==="
+          cd "$GITHUB_WORKSPACE/mpv-android/buildscripts"
+          # Add av3a to the audio decoder list
+          if ! grep -q "av3a" scripts/ffmpeg.sh; then
+            sed -i 's/vorbis,alac/vorbis,alac,av3a/' scripts/ffmpeg.sh
+          fi
+          # Add AV3A library to extra-ldflags (header is already in prefix include path)
+          # -lc++_static needed because AV3A decoder has C++ source files
+          if ! grep -q "av3a_decoder" scripts/ffmpeg.sh; then
+            sed -i 's|--extra-ldflags="-L\$prefix_dir/lib"|--extra-ldflags="-L$prefix_dir/lib -lav3a_decoder -lc++_static"|' scripts/ffmpeg.sh
+          fi
+          echo "=== ffmpeg.sh AV3A configuration ==="
+          grep -n "av3a\|extra-cflags\|extra-ldflags" scripts/ffmpeg.sh
+
+          echo "=== Step 5: Verify avs3 decoder is enabled ==="
+          if grep -q "avs3" scripts/ffmpeg.sh; then
+            echo "✓ avs3 decoder is enabled in ffmpeg.sh"
+            grep "avs3" scripts/ffmpeg.sh
+          else
+            echo "⚠ WARNING: avs3 decoder NOT found in ffmpeg.sh!"
+            echo "Current decoder list:"
+            grep "enable-decoder" scripts/ffmpeg.sh | head -20
+          fi
+
+          echo "=== AV3A support integration complete ==="
+
       - name: Build libmpv
         run: |
           cd mpv-android/buildscripts
           export IN_CI=1
           ./buildall.sh --arch ${{ matrix.arch.buildall_arg }} mpv
           find . -name "*.so" -ls 2>/dev/null || true
+
+      - name: Verify decoder support in built libavcodec.so
+        run: |
+          cd mpv-android/buildscripts
+          PREFIX_LIB=""
+          for d in "prefix/${{ matrix.arch.buildall_arg }}/lib" "prefix/arm64/lib" "prefix/armv7l/lib"; do
+            if [ -d "$d" ] && ls "$d"/*.so 1>/dev/null 2>&1; then
+              PREFIX_LIB="$d"
+              break
+            fi
+          done
+          [ -z "$PREFIX_LIB" ] && { echo "WARNING: No prefix lib dir found, skipping verification"; exit 0; }
+          AVCODEC_SO="$PREFIX_LIB/libavcodec.so"
+          [ -f "$AVCODEC_SO" ] || { echo "WARNING: libavcodec.so not found, skipping verification"; exit 0; }
+          echo "=== Verifying decoder symbols in $AVCODEC_SO ==="
+          echo "--- avs3 decoder ---"
+          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "avs3" || strings "$AVCODEC_SO" | grep -i "avs3"; then
+            echo "✓ avs3 decoder found in libavcodec.so"
+          else
+            echo "⚠ WARNING: avs3 decoder NOT found in libavcodec.so!"
+            echo "This means AVS3 video will not play in MPV."
+          fi
+          echo "--- av3a decoder ---"
+          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "av3a" || strings "$AVCODEC_SO" | grep -i "av3a"; then
+            echo "✓ av3a decoder found in libavcodec.so"
+          else
+            echo "⚠ WARNING: av3a decoder NOT found in libavcodec.so!"
+            echo "This means AV3A audio will not play in MPV."
+          fi
+          echo "--- cavs decoder ---"
+          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "cavs" || strings "$AVCODEC_SO" | grep -i "cavs"; then
+            echo "✓ cavs decoder found in libavcodec.so"
+          else
+            echo "⚠ WARNING: cavs decoder NOT found in libavcodec.so!"
+          fi
+          echo "--- davs2 decoder ---"
+          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "davs2" || strings "$AVCODEC_SO" | grep -i "davs2"; then
+            echo "✓ davs2 decoder found in libavcodec.so"
+          else
+            echo "⚠ WARNING: davs2 decoder NOT found in libavcodec.so!"
+          fi
 
       - name: Collect and strip all .so files
         run: |
@@ -703,6 +924,16 @@ jobs:
           else
             echo "WARNING: libdavs2.so not found in $PREFIX_LIB"
             find . -name "libdavs2.so" -ls 2>/dev/null || true
+          fi
+
+          # === Copy AV3A model.bin (neural network model for AV3A decoder) ===
+          MODEL_BIN=$(find "$GITHUB_WORKSPACE/ijkplayer-av3a" -name "model.bin" 2>/dev/null | head -1)
+          if [ -n "$MODEL_BIN" ] && [ -f "$MODEL_BIN" ]; then
+            mkdir -p "artifacts/${{ matrix.arch.name }}/assets"
+            cp "$MODEL_BIN" "artifacts/${{ matrix.arch.name }}/assets/model.bin"
+            echo "Copied AV3A model.bin to artifacts"
+          else
+            echo "Note: model.bin not found (AV3A decoder may work without it or needs it at runtime)"
           fi
 
           # === Fix versioned SONAME in libdavs2.so ===
