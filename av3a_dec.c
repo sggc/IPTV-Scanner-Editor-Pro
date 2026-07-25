@@ -36,6 +36,9 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
 
 /* AV3A decoder function pointer types */
 typedef void* (*av3a_create_fn)(void);
@@ -94,9 +97,76 @@ static void av3a_probe_decoder_info(AVCodecContext *avctx, AV3AContext *s)
            "AV3A: could not probe decoder info, using defaults (48000 Hz, 2ch)\n");
 }
 
+/*
+ * Ensure model.bin is accessible from CWD before calling Avs3AllocDecoder().
+ * The Java side tries to chdir() to filesDir via reflection, but this may fail
+ * on some Android versions due to hidden API restrictions. This C-level fallback
+ * reads /proc/self/cmdline to get the package name and chdir()s to the app's
+ * files directory, where App.java copies model.bin from assets.
+ */
+static int av3a_ensure_model_bin(AVCodecContext *avctx)
+{
+    /* First check if model.bin is already accessible from CWD */
+    FILE *f = fopen("model.bin", "rb");
+    if (f) {
+        fclose(f);
+        av_log(avctx, AV_LOG_INFO, "AV3A: model.bin found in CWD\n");
+        return 0;
+    }
+
+    /* Read package name from /proc/self/cmdline */
+    char pkg[256] = {0};
+    f = fopen("/proc/self/cmdline", "r");
+    if (!f) {
+        av_log(avctx, AV_LOG_ERROR, "AV3A: cannot read /proc/self/cmdline\n");
+        return -1;
+    }
+    /* cmdline is null-byte separated; first field is the package name */
+    size_t n = fread(pkg, 1, sizeof(pkg) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        av_log(avctx, AV_LOG_ERROR, "AV3A: empty cmdline\n");
+        return -1;
+    }
+    /* Ensure null-terminated string */
+    pkg[n] = '\0';
+    av_log(avctx, AV_LOG_INFO, "AV3A: package name = %s\n", pkg);
+
+    /* Construct path: /data/data/<pkg>/files */
+    char path[512];
+    snprintf(path, sizeof(path), "/data/data/%s/files", pkg);
+
+    /* Check if model.bin exists in that path */
+    char model_path[512];
+    snprintf(model_path, sizeof(model_path), "%s/model.bin", path);
+    f = fopen(model_path, "rb");
+    if (!f) {
+        av_log(avctx, AV_LOG_ERROR, "AV3A: model.bin not found at %s\n", model_path);
+        return -1;
+    }
+    fclose(f);
+
+    /* chdir to the files directory */
+    if (chdir(path) != 0) {
+        av_log(avctx, AV_LOG_ERROR, "AV3A: chdir(%s) failed (errno=%d)\n", path, errno);
+        return -1;
+    }
+
+    av_log(avctx, AV_LOG_INFO, "AV3A: chdir to %s successful, model.bin now accessible\n", path);
+    return 0;
+}
+
 static av_cold int av3a_decode_init(AVCodecContext *avctx)
 {
     AV3AContext *s = avctx->priv_data;
+
+    /* Ensure model.bin is accessible before loading the decoder library.
+     * libavs3a_decoder.so calls fopen("model.bin", "rb") internally during
+     * Avs3AllocDecoder(). If model.bin is not found, it will SIGSEGV. */
+    if (av3a_ensure_model_bin(avctx) != 0) {
+        av_log(avctx, AV_LOG_ERROR, "AV3A: model.bin not found, decoder cannot initialize\n");
+        return AVERROR_DECODER_NOT_FOUND;
+    }
 
     s->lib_handle = dlopen("libavs3a_decoder.so", RTLD_LAZY);
     if (!s->lib_handle) {
