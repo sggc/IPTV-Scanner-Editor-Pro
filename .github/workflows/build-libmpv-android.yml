@@ -672,10 +672,12 @@ jobs:
           sed -i 's/target_link_libraries(\${LIBNAME} pthread)/#target_link_libraries(\${LIBNAME} pthread)/' uavs3d-src/source/CMakeLists.txt
           # Remove -lpthread from pkg-config generation
           sed -i 's/-lpthread//' uavs3d-src/source/CMakeLists.txt
+          # Fix armv7: Android NDK Clang doesn't support -mfloat-abi=hard, use softfp instead
+          sed -i 's/-mfloat-abi=hard/-mfloat-abi=softfp/g' uavs3d-src/source/CMakeLists.txt
           # Also disable the test executable build
           sed -i 's/add_subdirectory(test)/#add_subdirectory(test)/' uavs3d-src/CMakeLists.txt
-          echo "=== Patched CMakeLists.txt pthread references ==="
-          grep -n "pthread\|Threads" uavs3d-src/source/CMakeLists.txt || echo "No pthread references remaining"
+          echo "=== Patched CMakeLists.txt ==="
+          grep -n "pthread\|Threads\|mfloat-abi" uavs3d-src/source/CMakeLists.txt || echo "All patches applied cleanly"
 
           # Determine NDK toolchain paths
           NDK_TRIPLE=""
@@ -885,6 +887,37 @@ jobs:
           fi
 
           echo "=== AV3A support integration complete ==="
+
+      - name: Verify dependencies before FFmpeg build
+        run: |
+          cd mpv-android/buildscripts
+          PREFIX_DIR=""
+          for d in "prefix/${{ matrix.arch.buildall_arg }}" "prefix/arm64" "prefix/armv7l"; do
+            if [ -d "$d/lib" ]; then
+              PREFIX_DIR="$d"
+              break
+            fi
+          done
+          [ -z "$PREFIX_DIR" ] && { echo "ERROR: prefix dir not found"; exit 1; }
+          echo "=== Prefix: $PREFIX_DIR ==="
+          echo "=== pkg-config files ==="
+          ls -la "$PREFIX_DIR/lib/pkgconfig/"*.pc 2>/dev/null || echo "No .pc files found!"
+          echo "=== dav1d check ==="
+          if [ -f "$PREFIX_DIR/lib/pkgconfig/dav1d.pc" ]; then
+            cat "$PREFIX_DIR/lib/pkgconfig/dav1d.pc"
+          else
+            echo "ERROR: dav1d.pc not found! dav1d build may have failed."
+            find . -name "dav1d*" -ls 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "=== uavs3d check ==="
+          if [ -f "$PREFIX_DIR/lib/pkgconfig/uavs3d.pc" ]; then
+            cat "$PREFIX_DIR/lib/pkgconfig/uavs3d.pc"
+          else
+            echo "WARNING: uavs3d.pc not found"
+          fi
+          echo "=== All .so files in prefix ==="
+          ls -la "$PREFIX_DIR/lib/"*.so* 2>/dev/null || echo "No .so files"
 
       - name: Build libmpv
         run: |
