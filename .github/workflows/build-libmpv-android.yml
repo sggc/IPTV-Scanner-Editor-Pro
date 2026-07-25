@@ -697,13 +697,25 @@ jobs:
           ANDROID_TOOLCHAIN="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
 
           echo "=== Building uavs3d for ${{ matrix.arch.name }} ==="
+
+          # CRITICAL: Create prefix directory with symlinks that buildall.sh expects.
+          # buildall.sh's setup_prefix() only creates usr/local symlinks if prefix dir
+          # doesn't exist yet. Our ninja install creates the dir first, causing
+          # buildall.sh to skip symlink creation. Without these symlinks, meson-based
+          # builds (dav1d, etc.) install pkgconfig files to prefix/usr/local/lib/
+          # instead of prefix/lib/, and FFmpeg configure can't find them.
+          PREFIX_DIR="$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix/${{ matrix.arch.buildall_arg }}"
+          mkdir -p "$PREFIX_DIR/lib/pkgconfig" "$PREFIX_DIR/include"
+          [ -L "$PREFIX_DIR/usr" ] || ln -s . "$PREFIX_DIR/usr"
+          [ -L "$PREFIX_DIR/local" ] || ln -s . "$PREFIX_DIR/local"
+
           mkdir -p uavs3d-build && cd uavs3d-build
           cmake -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_TOOLCHAIN" \
             -DANDROID_ABI="${{ matrix.arch.name }}" \
             -DANDROID_PLATFORM="android-${NDK_API_LEVEL}" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix/${{ matrix.arch.buildall_arg }}" \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX_DIR" \
             -DBUILD_SHARED_LIBS=ON \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             ../uavs3d-src
