@@ -133,7 +133,7 @@ jobs:
 
           # === 4. Patch ffmpeg.sh ===
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
-          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os/' scripts/ffmpeg.sh
+          sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os --extra-ldflags=-llog/' scripts/ffmpeg.sh
 
           # === 4c. Decoder list ===
           # NOTE: --enable-libuavs3d and --enable-libdavs2 are included here
@@ -844,13 +844,83 @@ jobs:
           # We only add the extern declaration; configure will discover it
           # and --enable-decoder=av3a will add it to codec_list.c.
           ALLCODECS_C="$FFMPEG_ABS/libavcodec/allcodecs.c"
+          echo "=== allcodecs.c before patching ==="
+          head -20 "$ALLCODECS_C"
+          echo "=== Searching for insertion point ==="
+          grep -n 'ff_aac_decoder' "$ALLCODECS_C" || echo "ff_aac_decoder not found"
+          grep -n 'extern.*FFCodec.*ff_.*_decoder' "$ALLCODECS_C" | head -5
           if ! grep -q "ff_av3a_decoder" "$ALLCODECS_C"; then
-            sed -i '/extern const FFCodec ff_aac_decoder;/a extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
-            echo "Added extern ff_av3a_decoder to allcodecs.c"
+            # Try multiple patterns to handle different FFmpeg versions
+            # Pattern 1: exact match (most common)
+            if grep -q 'extern const FFCodec ff_aac_decoder;' "$ALLCODECS_C"; then
+              sed -i '/extern const FFCodec ff_aac_decoder;/a extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
+              echo "Added extern ff_av3a_decoder after ff_aac_decoder (pattern 1)"
+            # Pattern 2: any aac decoder extern (handles spacing differences)
+            elif grep -q 'extern.*ff_aac.*decoder;' "$ALLCODECS_C"; then
+              sed -i '/extern.*ff_aac.*decoder;/a extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
+              echo "Added extern ff_av3a_decoder after ff_aac decoder (pattern 2)"
+            # Pattern 3: any decoder extern at all
+            elif grep -q 'extern.*FFCodec.*ff_.*_decoder;' "$ALLCODECS_C"; then
+              sed -i '0,/extern.*FFCodec.*ff_.*_decoder;/{/extern.*FFCodec.*ff_.*_decoder;/a extern const FFCodec ff_av3a_decoder;
+}' "$ALLCODECS_C"
+              echo "Added extern ff_av3a_decoder after first decoder extern (pattern 3)"
+            # Pattern 4: last resort, insert at top of file after includes
+            else
+              echo "WARNING: No decoder extern found in allcodecs.c, inserting at top"
+              sed -i '1i extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
+            fi
           else
             echo "ff_av3a_decoder already in allcodecs.c"
           fi
+          # CRITICAL: Verify the extern was actually added
+          if ! grep -q 'ff_av3a_decoder' "$ALLCODECS_C"; then
+            echo "FATAL: Failed to add ff_av3a_decoder to allcodecs.c!"
+            echo "=== allcodecs.c contents (first 30 lines) ==="
+            head -30 "$ALLCODECS_C"
+            exit 1
+          fi
+          echo "=== allcodecs.c after patching ==="
           grep -n "av3a" "$ALLCODECS_C"
+
+          # 3c-bis: Patch ffmpeg.sh to patch codec_list.c after configure
+          # Even if allcodecs.c patching works, the configure script might not
+          # pick up the new extern. As a FAILSAFE, we insert a post-configure
+          # step in ffmpeg.sh that directly patches codec_list.c.
+          echo "=== Patching ffmpeg.sh to add codec_list.c post-configure patch ==="
+          FFMPEG_SH="$GITHUB_WORKSPACE/mpv-android/buildscripts/scripts/ffmpeg.sh"
+          python3 -c "
+import re, sys
+with open(sys.argv[1], 'r') as f:
+    content = f.read()
+patch = r'''
+    # --- AV3A FAILSAFE: Patch codec_list.c to ensure ff_av3a_decoder is registered ---
+    if [ -f libavcodec/codec_list.c ] && ! grep -q ff_av3a_decoder libavcodec/codec_list.c; then
+        sed -i 's/\\(const FFCodec \\* const codec_list\\[\\] = {\\)/\\1\\n    \\&ff_av3a_decoder,/' libavcodec/codec_list.c
+        echo 'PATCHED codec_list.c to add ff_av3a_decoder (FAILSAFE)'
+        grep -n av3a libavcodec/codec_list.c || echo 'WARNING: av3a still not in codec_list.c!'
+    elif [ -f libavcodec/codec_list.c ]; then
+        echo 'codec_list.c already has ff_av3a_decoder'
+    else
+        echo 'WARNING: codec_list.c not found, cannot patch'
+    fi
+    # --- End AV3A FAILSAFE ---
+
+'''
+lines = content.split('\\n')
+new_lines = []
+inserted = False
+for line in lines:
+    if not inserted and re.match(r'^\\s*make\\s', line):
+        new_lines.append(patch)
+        inserted = True
+    new_lines.append(line)
+if not inserted:
+    print('WARNING: Could not find make in ffmpeg.sh')
+else:
+    print('Inserted codec_list.c FAILSAFE patch before make in ffmpeg.sh')
+with open(sys.argv[1], 'w') as f:
+    f.write('\\n'.join(new_lines))
+" "$FFMPEG_SH"
 
           # 3d. Add to Makefile
           MAKEFILE="$FFMPEG_ABS/libavcodec/Makefile"
@@ -1115,6 +1185,45 @@ jobs:
               echo "ERROR: av3a decoder NOT found!"
               exit 1
             fi
+          fi
+          # CRITICAL: Check that ff_av3a_decoder is actually in codec_list.c
+          # CONFIG_AV3A_DECODER=1 alone is NOT enough — the codec must be
+          # registered in codec_list[] for avcodec_find_decoder() to find it.
+          echo "=== Checking codec_list.c for ff_av3a_decoder ==="
+          CODEC_LIST_C=""
+          if [ -n "$FFMPEG_DIR" ]; then
+            for f in "$FFMPEG_DIR/libavcodec/codec_list.c" "$FFMPEG_DIR/ffbuild/codec_list.c"; do
+              [ -f "$f" ] && CODEC_LIST_C="$f" && break
+            done
+          fi
+          if [ -n "$CODEC_LIST_C" ]; then
+            echo "Checking $CODEC_LIST_C"
+            if grep -q "ff_av3a_decoder" "$CODEC_LIST_C"; then
+              echo "✓ ff_av3a_decoder IS in codec_list.c — decoder will be registered"
+            else
+              echo "FATAL: ff_av3a_decoder is NOT in codec_list.c!"
+              echo "=== codec_list.c contents (audio decoders section) ==="
+              grep -n "decoder" "$CODEC_LIST_C" | head -40
+              echo "=== allcodecs.c av3a check ==="
+              grep -n "av3a" "$FFMPEG_DIR/libavcodec/allcodecs.c" || echo "(no av3a in allcodecs.c)"
+              exit 1
+            fi
+          else
+            echo "WARNING: codec_list.c not found, skipping check"
+          fi
+          # CRITICAL: Check that the AV3A codec name string is in the binary
+          # The ff_av3a_decoder struct has .p.name = "av3a" and .p.long_name
+          # = "AVS3-P3 Audio Vivid (AV3A)". If the struct is in the .so,
+          # these strings must be present.
+          echo "=== Checking libavcodec.so for AV3A codec strings ==="
+          if strings "$AVCODEC_SO" | grep -q "AVS3-P3"; then
+            echo "✓ AVS3-P3 string found in libavcodec.so — ff_av3a_decoder struct is linked"
+          else
+            echo "FATAL: AVS3-P3 string NOT found in libavcodec.so!"
+            echo "This means ff_av3a_decoder was stripped from the binary."
+            echo "The codec_list.c patching did not work."
+            strings "$AVCODEC_SO" | grep -i "av3a" || echo "(no av3a strings at all)"
+            exit 1
           fi
           echo "--- cavs decoder ---"
           if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "cavs" || strings "$AVCODEC_SO" | grep -i "cavs"; then
