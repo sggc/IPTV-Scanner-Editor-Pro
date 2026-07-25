@@ -133,12 +133,15 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
     }
 
     s->first_frame = 1;
-    s->channels = 2;
-    s->sample_rate = 48000;
+    /* Use container-provided values if available, otherwise default to 48000 Hz stereo.
+     * The actual values will be probed from the decoder struct after the first decode. */
+    s->sample_rate = avctx->sample_rate > 0 ? avctx->sample_rate : 48000;
+    s->channels = avctx->ch_layout.nb_channels > 0 ? avctx->ch_layout.nb_channels : 2;
 
     avctx->sample_fmt = AV_SAMPLE_FMT_S16;
     avctx->sample_rate = s->sample_rate;
-    av_channel_layout_default(&avctx->ch_layout, s->channels);
+    if (avctx->ch_layout.nb_channels == 0)
+        av_channel_layout_default(&avctx->ch_layout, s->channels);
 
     av_log(avctx, AV_LOG_INFO, "AV3A: decoder initialized (dlopen + dlsym)\n");
     return 0;
@@ -247,6 +250,6 @@ const FFCodec ff_av3a_decoder = {
     .init           = av3a_decode_init,
     .close          = av3a_decode_close,
     FF_CODEC_DECODE_CB(av3a_decode_frame),
-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY | AV_CODEC_CAP_CHANNEL_CONF,
     .p.sample_fmts  = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_NONE },
 };
