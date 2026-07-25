@@ -110,7 +110,7 @@ static int av3a_ensure_model_bin(AVCodecContext *avctx)
     FILE *f = fopen("model.bin", "rb");
     if (f) {
         fclose(f);
-        av_log(avctx, AV_LOG_INFO, "AV3A: model.bin found in CWD\n");
+        av_log(avctx, AV_LOG_ERROR, "AV3A: model.bin found in CWD\n");
         return 0;
     }
 
@@ -130,7 +130,7 @@ static int av3a_ensure_model_bin(AVCodecContext *avctx)
     }
     /* Ensure null-terminated string */
     pkg[n] = '\0';
-    av_log(avctx, AV_LOG_INFO, "AV3A: package name = %s\n", pkg);
+    av_log(avctx, AV_LOG_ERROR, "AV3A: package name = %s\n", pkg);
 
     /* Construct path: /data/data/<pkg>/files */
     char path[512];
@@ -152,13 +152,14 @@ static int av3a_ensure_model_bin(AVCodecContext *avctx)
         return -1;
     }
 
-    av_log(avctx, AV_LOG_INFO, "AV3A: chdir to %s successful, model.bin now accessible\n", path);
+    av_log(avctx, AV_LOG_ERROR, "AV3A: chdir to %s successful, model.bin now accessible\n", path);
     return 0;
 }
 
 static av_cold int av3a_decode_init(AVCodecContext *avctx)
 {
     AV3AContext *s = avctx->priv_data;
+    av_log(avctx, AV_LOG_ERROR, "AV3A: av3a_decode_init called\n");
 
     /* Ensure model.bin is accessible before loading the decoder library.
      * libavs3a_decoder.so calls fopen("model.bin", "rb") internally during
@@ -213,7 +214,7 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
     if (avctx->ch_layout.nb_channels == 0)
         av_channel_layout_default(&avctx->ch_layout, s->channels);
 
-    av_log(avctx, AV_LOG_INFO, "AV3A: decoder initialized (dlopen + dlsym)\n");
+    av_log(avctx, AV_LOG_ERROR, "AV3A: decoder initialized (dlopen + dlsym)\n");
     return 0;
 }
 
@@ -230,10 +231,15 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     /* Step 1: parse header */
     int header_consumed = 0;
-    s->fn_parse_header(s->decoder, avpkt->data, avpkt->size,
+    int parse_result = s->fn_parse_header(s->decoder, avpkt->data, avpkt->size,
                        s->first_frame ? 1 : 0, &header_consumed, NULL);
 
-    if (header_consumed <= 0 || header_consumed >= avpkt->size) {
+    if (s->first_frame) {
+        av_log(avctx, AV_LOG_ERROR, "AV3A: parse_header result=%d consumed=%d size=%d\n",
+               parse_result, header_consumed, avpkt->size);
+    }
+
+    if (parse_result != 1 || header_consumed <= 0 || header_consumed >= avpkt->size) {
         av_log(avctx, AV_LOG_DEBUG,
                "AV3A: parse_header: consumed=%d size=%d\n",
                header_consumed, avpkt->size);
@@ -243,15 +249,15 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     /* Step 2: decode payload into temp buffer */
     int output_bytes = 0;
     int payload_consumed = 0;
-    s->fn_decode(s->decoder,
+    int decode_result = s->fn_decode(s->decoder,
                  avpkt->data + header_consumed,
                  avpkt->size - header_consumed,
                  temp_output, &output_bytes, &payload_consumed);
 
     if (output_bytes <= 0) {
-        av_log(avctx, AV_LOG_DEBUG,
-               "AV3A: decode: output=%d payload_consumed=%d\n",
-               output_bytes, payload_consumed);
+        av_log(avctx, AV_LOG_ERROR,
+               "AV3A: decode: result=%d output=%d payload_consumed=%d\n",
+               decode_result, output_bytes, payload_consumed);
         return avpkt->size;
     }
 
