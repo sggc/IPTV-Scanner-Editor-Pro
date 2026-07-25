@@ -666,10 +666,16 @@ jobs:
 
           # Patch: Android/Bionic has pthread built into libc, no -lpthread needed
           echo "=== Patching uavs3d CMakeLists.txt for Android ==="
-          sed -i 's/-lpthread//g' uavs3d-src/source/CMakeLists.txt
-          sed -i 's/${CMAKE_THREAD_LIBS_INIT}//g' uavs3d-src/source/CMakeLists.txt
-          # Also disable the test executable build (not needed, causes issues)
+          # Disable find_package(Threads) entirely
+          sed -i 's/find_package(Threads REQUIRED)/#find_package(Threads REQUIRED)/' uavs3d-src/source/CMakeLists.txt
+          # Comment out target_link_libraries with pthread
+          sed -i 's/target_link_libraries(\${LIBNAME} pthread)/#target_link_libraries(\${LIBNAME} pthread)/' uavs3d-src/source/CMakeLists.txt
+          # Remove -lpthread from pkg-config generation
+          sed -i 's/-lpthread//' uavs3d-src/source/CMakeLists.txt
+          # Also disable the test executable build
           sed -i 's/add_subdirectory(test)/#add_subdirectory(test)/' uavs3d-src/CMakeLists.txt
+          echo "=== Patched CMakeLists.txt pthread references ==="
+          grep -n "pthread\|Threads" uavs3d-src/source/CMakeLists.txt || echo "No pthread references remaining"
 
           # Determine NDK toolchain paths
           NDK_TRIPLE=""
