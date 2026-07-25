@@ -664,6 +664,13 @@ jobs:
           echo "=== Cloning uavs3d ==="
           git clone --depth 1 https://github.com/uavs3/uavs3d.git uavs3d-src
 
+          # Patch: Android/Bionic has pthread built into libc, no -lpthread needed
+          echo "=== Patching uavs3d CMakeLists.txt for Android ==="
+          sed -i 's/-lpthread//g' uavs3d-src/source/CMakeLists.txt
+          sed -i 's/${CMAKE_THREAD_LIBS_INIT}//g' uavs3d-src/source/CMakeLists.txt
+          # Also disable the test executable build (not needed, causes issues)
+          sed -i 's/add_subdirectory(test)/#add_subdirectory(test)/' uavs3d-src/CMakeLists.txt
+
           # Determine NDK toolchain paths
           NDK_TRIPLE=""
           NDK_CMAKE_TRIPLE=""
