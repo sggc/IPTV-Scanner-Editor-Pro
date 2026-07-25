@@ -141,7 +141,7 @@ jobs:
             '	--enable-decoder=h264,hevc,mpeg1video,mpeg2video,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3' \
             '	--enable-decoder=h263,h263i,h263p,flv,svq1,svq3,amv' \
             '	--enable-decoder=vp3,vp5,vp6,vp6a,vp6f,vp7,vp8,vp9,av1' \
-            '	--enable-decoder=cavs,libdav1d,libdavs2,avs3' \
+            '	--enable-decoder=cavs,libdav1d,libdavs2,libuavs3d' \
             '	--enable-decoder=vc1,vc1image,wmv1,wmv2,wmv3,wmv3image' \
             '	--enable-decoder=theora,dvvideo,rawvideo' \
             '	--enable-decoder=mjpeg,jpegls,png,prores,ffv1,huffyuv' \
@@ -744,7 +744,7 @@ jobs:
 
           if [ ! -f "$PC_FILE" ]; then
             echo "=== Creating fallback uavs3d.pc ==="
-            printf 'prefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${exec_prefix}/lib\nincludedir=${prefix}/include\n\nName: uavs3d\nDescription: AVS3 decoder\nVersion: 1.0.0\nLibs: -L${libdir} -luavs3d\nCflags: %s\n' "$UAVS3D_INC_DIR" > "$PC_FILE"
+            printf 'prefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${exec_prefix}/lib\nincludedir=${prefix}/include\n\nName: uavs3d\nDescription: AVS3 decoder\nVersion: 1.2.1\nLibs: -L${libdir} -luavs3d\nCflags: %s\n' "$UAVS3D_INC_DIR" > "$PC_FILE"
             echo "Created uavs3d.pc:"
             cat "$PC_FILE"
           else
@@ -756,11 +756,25 @@ jobs:
         run: |
           cd mpv-android/buildscripts
           # Add --enable-libuavs3d to ffmpeg configure flags
+          # Method 1: try to add to the brace expansion
           if ! grep -q "libuavs3d" scripts/ffmpeg.sh; then
             sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2,libuavs3d}/' scripts/ffmpeg.sh
           fi
-          echo "=== ffmpeg.sh libuavs3d check ==="
-          grep -n "uavs3d\|avs3" scripts/ffmpeg.sh
+          # Method 2: if still not present, append before the closing ) of args array
+          if ! grep -q "libuavs3d" scripts/ffmpeg.sh; then
+            sed -i '/^)/i\    --enable-libuavs3d' scripts/ffmpeg.sh
+          fi
+          echo "=== ffmpeg.sh after libuavs3d patch ==="
+          grep -n "uavs3d\|avs3" scripts/ffmpeg.sh || echo "ERROR: libuavs3d not found in ffmpeg.sh!"
+          # Verify the decoder name is libuavs3d (not avs3 — FFmpeg registers it as libuavs3d)
+          if grep -q 'enable-decoder=.*avs3' scripts/ffmpeg.sh && ! grep -q 'enable-decoder=.*libuavs3d' scripts/ffmpeg.sh; then
+            echo "ERROR: decoder list has 'avs3' but should be 'libuavs3d'!"
+            sed -i 's/enable-decoder=\([^ ]*\)avs3/enable-decoder=\1libuavs3d/' scripts/ffmpeg.sh
+            echo "Fixed decoder name to libuavs3d"
+            grep -n "libuavs3d" scripts/ffmpeg.sh
+          fi
+          echo "=== Final ffmpeg.sh configure flags ==="
+          grep -n 'enable-' scripts/ffmpeg.sh | head -30
 
       - name: Download AV3A decoder library and patch FFmpeg
         run: |
@@ -958,11 +972,22 @@ jobs:
           [ -f "$AVCODEC_SO" ] || { echo "WARNING: libavcodec.so not found, skipping verification"; exit 0; }
           echo "=== Verifying decoder symbols in $AVCODEC_SO ==="
           echo "--- avs3 decoder ---"
-          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "avs3" || strings "$AVCODEC_SO" | grep -i "avs3"; then
-            echo "✓ avs3 decoder found in libavcodec.so"
+          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "uavs3d\|avs3" || strings "$AVCODEC_SO" | grep -i "uavs3d\|avs3"; then
+            echo "✓ avs3/uavs3d decoder found in libavcodec.so"
           else
-            echo "⚠ WARNING: avs3 decoder NOT found in libavcodec.so!"
+            echo "ERROR: avs3/uavs3d decoder NOT found in libavcodec.so!"
             echo "This means AVS3 video will not play in MPV."
+            echo "=== Dumping FFmpeg config.log for diagnosis ==="
+            FFMPEG_DIR=""
+            for c in deps/ffmpeg sources/ffmpeg; do
+              [ -d "$c/ffbuild" ] && FFMPEG_DIR="$c" && break
+            done
+            if [ -n "$FFMPEG_DIR" ] && [ -f "$FFMPEG_DIR/ffbuild/config.log" ]; then
+              grep -i "uavs3d\|avs3\|libuavs3d" "$FFMPEG_DIR/ffbuild/config.log" | tail -30
+            else
+              echo "config.log not found"
+            fi
+            exit 1
           fi
           echo "--- av3a decoder ---"
           if nm -D "$AVCODEC_SO" 2>/dev/null | grep -i "av3a" || strings "$AVCODEC_SO" | grep -i "av3a"; then
