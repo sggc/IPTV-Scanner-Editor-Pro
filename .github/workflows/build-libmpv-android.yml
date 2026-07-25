@@ -658,6 +658,87 @@ jobs:
           fi
           ls -la libavcodec/libcavs* libavcodec/dradec* 2>/dev/null || { echo "ERROR: CAVS patch failed"; exit 1; }
 
+      - name: Build libuavs3d (AVS3 video decoder library)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          echo "=== Cloning uavs3d ==="
+          git clone --depth 1 https://github.com/uavs3/uavs3d.git uavs3d-src
+
+          # Determine NDK toolchain paths
+          NDK_TRIPLE=""
+          NDK_CMAKE_TRIPLE=""
+          case "${{ matrix.arch.name }}" in
+            arm64-v8a)    NDK_TRIPLE="aarch64-linux-android"; NDK_CMAKE_TRIPLE="aarch64-linux-android" ;;
+            armeabi-v7a)  NDK_TRIPLE="armv7a-linux-androideabi"; NDK_CMAKE_TRIPLE="armv7a-linux-androideabi" ;;
+          esac
+          NDK_API_LEVEL=21
+          ANDROID_TOOLCHAIN="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+
+          echo "=== Building uavs3d for ${{ matrix.arch.name }} ==="
+          mkdir -p uavs3d-build && cd uavs3d-build
+          cmake -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_TOOLCHAIN" \
+            -DANDROID_ABI="${{ matrix.arch.name }}" \
+            -DANDROID_PLATFORM="android-${NDK_API_LEVEL}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix/${{ matrix.arch.buildall_arg }}" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            ../uavs3d-src
+          ninja -j$(nproc)
+          ninja install
+
+          echo "=== uavs3d installed ==="
+          PREFIX_DIR="$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix/${{ matrix.arch.buildall_arg }}"
+          ls -la "$PREFIX_DIR/lib/"*uavs3d* 2>/dev/null
+          ls -la "$PREFIX_DIR/include/"*uavs3* 2>/dev/null || ls -la "$PREFIX_DIR/include/uavs3d/" 2>/dev/null || true
+
+          # Ensure pkg-config file exists (fallback if CMake didn't generate one)
+          PC_FILE="$PREFIX_DIR/lib/pkgconfig/uavs3d.pc"
+          mkdir -p "$PREFIX_DIR/lib/pkgconfig"
+
+          # Determine correct include path for uavs3d headers
+          UAVS3D_INC_DIR=""
+          if [ -f "$PREFIX_DIR/include/uavs3d.h" ]; then
+            UAVS3D_INC_DIR="-I\${includedir}"
+          elif [ -f "$PREFIX_DIR/include/uavs3d/uavs3d.h" ]; then
+            UAVS3D_INC_DIR="-I\${includedir} -I\${includedir}/uavs3d"
+            # Also copy header to top-level include for FFmpeg to find
+            cp "$PREFIX_DIR/include/uavs3d/uavs3d.h" "$PREFIX_DIR/include/uavs3d.h" 2>/dev/null || true
+            UAVS3D_INC_DIR="-I\${includedir}"
+          fi
+
+          if [ ! -f "$PC_FILE" ]; then
+            echo "=== Creating fallback uavs3d.pc ==="
+            cat > "$PC_FILE" <<PCEOF
+prefix=/usr/local
+exec_prefix=\${prefix}
+libdir=\${exec_prefix}/lib
+includedir=\${prefix}/include
+
+Name: uavs3d
+Description: AVS3 decoder
+Version: 1.0.0
+Libs: -L\${libdir} -luavs3d
+Cflags: $UAVS3D_INC_DIR
+PCEOF
+            echo "Created uavs3d.pc:"
+            cat "$PC_FILE"
+          else
+            echo "uavs3d.pc already exists:"
+            cat "$PC_FILE"
+          fi
+
+      - name: Patch ffmpeg.sh to enable libuavs3d
+        run: |
+          cd mpv-android/buildscripts
+          # Add --enable-libuavs3d to ffmpeg configure flags
+          if ! grep -q "libuavs3d" scripts/ffmpeg.sh; then
+            sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2,libuavs3d}/' scripts/ffmpeg.sh
+          fi
+          echo "=== ffmpeg.sh libuavs3d check ==="
+          grep -n "uavs3d\|avs3" scripts/ffmpeg.sh
+
       - name: Download AV3A decoder library and patch FFmpeg
         run: |
           cd mpv-android/buildscripts
@@ -728,15 +809,16 @@ jobs:
           grep -n "AV_CODEC_ID_AV3A" "$CODEC_ID_H" || { echo "ERROR: Failed to add AV_CODEC_ID_AV3A"; exit 1; }
 
           # 3c. Register decoder in allcodecs.c
+          # In FFmpeg n8.0, allcodecs.c only has extern declarations.
+          # The codec array is auto-generated in codec_list.c by configure.
+          # We only add the extern declaration; configure will discover it
+          # and --enable-decoder=av3a will add it to codec_list.c.
           ALLCODECS_C="$FFMPEG_ABS/libavcodec/allcodecs.c"
           if ! grep -q "ff_av3a_decoder" "$ALLCODECS_C"; then
-            # Add extern declaration near other audio decoder externs
             sed -i '/extern const FFCodec ff_aac_decoder;/a extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
-            # Add to codec list (after aac decoder entry)
-            sed -i '/ff_aac_decoder/i\    &ff_av3a_decoder,' "$ALLCODECS_C"
-            echo "Registered ff_av3a_decoder in allcodecs.c"
+            echo "Added extern ff_av3a_decoder to allcodecs.c"
           else
-            echo "ff_av3a_decoder already registered in allcodecs.c"
+            echo "ff_av3a_decoder already in allcodecs.c"
           fi
           grep -n "av3a" "$ALLCODECS_C"
 
@@ -769,9 +851,15 @@ jobs:
           # 3f. Add codec descriptor
           CODEC_DESC_C="$FFMPEG_ABS/libavcodec/codec_desc.c"
           if [ -f "$CODEC_DESC_C" ] && ! grep -q "AV_CODEC_ID_AV3A" "$CODEC_DESC_C"; then
-            # Add codec descriptor before the sentinel entry
-            sed -i '/AV_CODEC_ID_NONE,/i\    { AV_CODEC_ID_AV3A, AV_CODEC_PROP_LOSSY, "av3a", "AVS3-P3 Audio Vivid (AV3A)", 0 },' "$CODEC_DESC_C" 2>/dev/null || true
-            echo "Added AV3A codec descriptor"
+            # Add codec descriptor using designated initializers (FFmpeg n8.0 style)
+            # Insert before the subtitle codecs section sentinel
+            perl -i -pe 'if (/AV_CODEC_ID_FIRST_SUBTITLE/) { $_ = qq(    {\n        .id         = AV_CODEC_ID_AV3A,\n        .type       = AVMEDIA_TYPE_AUDIO,\n        .name       = "av3a",\n        .long_name  = NULL_IF_CONFIG_SMALL("AVS3-P3 Audio Vivid (AV3A)"),\n        .props      = AV_CODEC_PROP_LOSSY,\n    },\n) . $_; }' "$CODEC_DESC_C" 2>/dev/null
+            if grep -q "AV_CODEC_ID_AV3A" "$CODEC_DESC_C"; then
+              echo "Added AV3A codec descriptor (designated initializers)"
+            else
+              echo "WARNING: Could not add AV3A codec descriptor, trying alternative"
+              sed -i '/AV_CODEC_ID_NONE,/i\    { .id = AV_CODEC_ID_AV3A, .type = AVMEDIA_TYPE_AUDIO, .name = "av3a", .long_name = NULL_IF_CONFIG_SMALL("AVS3-P3 Audio Vivid (AV3A)"), .props = AV_CODEC_PROP_LOSSY },' "$CODEC_DESC_C" 2>/dev/null || true
+            fi
           fi
 
           echo "=== Step 4: Update ffmpeg.sh to enable AV3A decoder ==="
@@ -917,6 +1005,20 @@ jobs:
               patchelf --replace-needed libdavs2.so.16 libdavs2.so "$AVCODEC_SO"
               echo "Patched libavcodec.so NEEDED: libdavs2.so.16 -> libdavs2.so"
             fi
+          fi
+
+          # === Fix libuavs3d.so SONAME if needed ===
+          UAVS3D_SO="artifacts/${{ matrix.arch.name }}/libuavs3d.so"
+          if [ -f "$UAVS3D_SO" ]; then
+            OLD_SONAME=$(patchelf --print-soname "$UAVS3D_SO" 2>/dev/null || echo "")
+            echo "libuavs3d.so current SONAME: '$OLD_SONAME'"
+            if [ "$OLD_SONAME" != "libuavs3d.so" ]; then
+              patchelf --set-soname libuavs3d.so "$UAVS3D_SO"
+              echo "Patched libuavs3d.so SONAME -> libuavs3d.so"
+            fi
+          else
+            echo "WARNING: libuavs3d.so not found in artifacts!"
+            find "$GITHUB_WORKSPACE/mpv-android/buildscripts/prefix" -name "*uavs3d*" -ls 2>/dev/null || true
           fi
 
           echo "=== Final artifacts ==="
