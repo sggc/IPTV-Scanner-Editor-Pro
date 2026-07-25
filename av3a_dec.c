@@ -40,6 +40,17 @@
 #include <errno.h>
 #include <stdio.h>
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#define AV3A_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "AV3A", __VA_ARGS__)
+#define AV3A_LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "AV3A", __VA_ARGS__)
+#define AV3A_LOGW(...) __android_log_print(ANDROID_LOG_WARN,  "AV3A", __VA_ARGS__)
+#else
+#define AV3A_LOGE(...) av_log(NULL, AV_LOG_ERROR, __VA_ARGS__)
+#define AV3A_LOGI(...) av_log(NULL, AV_LOG_INFO,  __VA_ARGS__)
+#define AV3A_LOGW(...) av_log(NULL, AV_LOG_WARNING, __VA_ARGS__)
+#endif
+
 /* AV3A decoder function pointer types */
 typedef void* (*av3a_create_fn)(void);
 typedef void  (*av3a_destroy_fn)(void*);
@@ -85,16 +96,14 @@ static void av3a_probe_decoder_info(AVCodecContext *avctx, AV3AContext *s)
                 if (ch >= 1 && ch <= 64) {
                     s->sample_rate = val;
                     s->channels = ch;
-                    av_log(avctx, AV_LOG_INFO,
-                           "AV3A: probed sample_rate=%d channels=%d (offsets %d,%d)\n",
+                    AV3A_LOGI("probed sample_rate=%d channels=%d (offsets %d,%d)\n",
                            val, ch, i, j);
                     return;
                 }
             }
         }
     }
-    av_log(avctx, AV_LOG_WARNING,
-           "AV3A: could not probe decoder info, using defaults (48000 Hz, 2ch)\n");
+    AV3A_LOGW("could not probe decoder info, using defaults (48000 Hz, 2ch)\n");
 }
 
 /*
@@ -110,7 +119,7 @@ static int av3a_ensure_model_bin(AVCodecContext *avctx)
     FILE *f = fopen("model.bin", "rb");
     if (f) {
         fclose(f);
-        av_log(avctx, AV_LOG_ERROR, "AV3A: model.bin found in CWD\n");
+        AV3A_LOGI("model.bin found in CWD\n");
         return 0;
     }
 
@@ -118,19 +127,19 @@ static int av3a_ensure_model_bin(AVCodecContext *avctx)
     char pkg[256] = {0};
     f = fopen("/proc/self/cmdline", "r");
     if (!f) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: cannot read /proc/self/cmdline\n");
+        AV3A_LOGE("cannot read /proc/self/cmdline\n");
         return -1;
     }
     /* cmdline is null-byte separated; first field is the package name */
     size_t n = fread(pkg, 1, sizeof(pkg) - 1, f);
     fclose(f);
     if (n == 0) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: empty cmdline\n");
+        AV3A_LOGE("empty cmdline\n");
         return -1;
     }
     /* Ensure null-terminated string */
     pkg[n] = '\0';
-    av_log(avctx, AV_LOG_ERROR, "AV3A: package name = %s\n", pkg);
+    AV3A_LOGI("package name = %s\n", pkg);
 
     /* Construct path: /data/data/<pkg>/files */
     char path[512];
@@ -141,37 +150,37 @@ static int av3a_ensure_model_bin(AVCodecContext *avctx)
     snprintf(model_path, sizeof(model_path), "%s/model.bin", path);
     f = fopen(model_path, "rb");
     if (!f) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: model.bin not found at %s\n", model_path);
+        AV3A_LOGE("model.bin not found at %s\n", model_path);
         return -1;
     }
     fclose(f);
 
     /* chdir to the files directory */
     if (chdir(path) != 0) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: chdir(%s) failed (errno=%d)\n", path, errno);
+        AV3A_LOGE("chdir(%s) failed (errno=%d)\n", path, errno);
         return -1;
     }
 
-    av_log(avctx, AV_LOG_ERROR, "AV3A: chdir to %s successful, model.bin now accessible\n", path);
+    AV3A_LOGI("chdir to %s successful, model.bin now accessible\n", path);
     return 0;
 }
 
 static av_cold int av3a_decode_init(AVCodecContext *avctx)
 {
     AV3AContext *s = avctx->priv_data;
-    av_log(avctx, AV_LOG_ERROR, "AV3A: av3a_decode_init called\n");
+    AV3A_LOGI("av3a_decode_init called\n");
 
     /* Ensure model.bin is accessible before loading the decoder library.
      * libavs3a_decoder.so calls fopen("model.bin", "rb") internally during
      * Avs3AllocDecoder(). If model.bin is not found, it will SIGSEGV. */
     if (av3a_ensure_model_bin(avctx) != 0) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: model.bin not found, decoder cannot initialize\n");
+        AV3A_LOGE("model.bin not found, decoder cannot initialize\n");
         return AVERROR_DECODER_NOT_FOUND;
     }
 
     s->lib_handle = dlopen("libavs3a_decoder.so", RTLD_LAZY);
     if (!s->lib_handle) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: dlopen failed: %s\n", dlerror());
+        AV3A_LOGE("dlopen failed: %s\n", dlerror());
         return AVERROR_DECODER_NOT_FOUND;
     }
 
@@ -189,7 +198,7 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
     s->fn_decode      = (av3a_decode_fn)      dlsym(s->lib_handle, "Avs3Decode");
 
     if (!s->fn_create || !s->fn_destroy || !s->fn_parse_header || !s->fn_decode) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: missing symbols in libavs3a_decoder.so\n");
+        AV3A_LOGE("missing symbols in libavs3a_decoder.so\n");
         dlclose(s->lib_handle);
         s->lib_handle = NULL;
         return AVERROR_DECODER_NOT_FOUND;
@@ -197,7 +206,7 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
 
     s->decoder = s->fn_create();
     if (!s->decoder) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: Avs3AllocDecoder returned NULL\n");
+        AV3A_LOGE("Avs3AllocDecoder returned NULL\n");
         dlclose(s->lib_handle);
         s->lib_handle = NULL;
         return AVERROR_DECODER_NOT_FOUND;
@@ -214,7 +223,7 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
     if (avctx->ch_layout.nb_channels == 0)
         av_channel_layout_default(&avctx->ch_layout, s->channels);
 
-    av_log(avctx, AV_LOG_ERROR, "AV3A: decoder initialized (dlopen + dlsym)\n");
+    AV3A_LOGI("decoder initialized (dlopen + dlsym)\n");
     return 0;
 }
 
@@ -235,13 +244,12 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                        s->first_frame ? 1 : 0, &header_consumed, NULL);
 
     if (s->first_frame) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: parse_header result=%d consumed=%d size=%d\n",
+        AV3A_LOGI("parse_header result=%d consumed=%d size=%d\n",
                parse_result, header_consumed, avpkt->size);
     }
 
     if (parse_result != 1 || header_consumed <= 0 || header_consumed >= avpkt->size) {
-        av_log(avctx, AV_LOG_DEBUG,
-               "AV3A: parse_header: consumed=%d size=%d\n",
+        AV3A_LOGI("parse_header: consumed=%d size=%d\n",
                header_consumed, avpkt->size);
         return avpkt->size;
     }
@@ -255,8 +263,7 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                  temp_output, &output_bytes, &payload_consumed);
 
     if (output_bytes <= 0) {
-        av_log(avctx, AV_LOG_ERROR,
-               "AV3A: decode: result=%d output=%d payload_consumed=%d\n",
+        AV3A_LOGW("decode: result=%d output=%d payload_consumed=%d\n",
                decode_result, output_bytes, payload_consumed);
         return avpkt->size;
     }
@@ -268,8 +275,7 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         av_channel_layout_uninit(&avctx->ch_layout);
         av_channel_layout_default(&avctx->ch_layout, s->channels);
         s->first_frame = 0;
-        av_log(avctx, AV_LOG_INFO,
-               "AV3A: format set to %d Hz, %d ch\n",
+        AV3A_LOGI("format set to %d Hz, %d ch\n",
                s->sample_rate, s->channels);
     }
 
@@ -277,8 +283,7 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     int bytes_per_sample = 2; /* S16 */
     int nb_samples = output_bytes / (s->channels * bytes_per_sample);
     if (nb_samples <= 0) {
-        av_log(avctx, AV_LOG_WARNING,
-               "AV3A: invalid nb_samples=%d (output=%d ch=%d)\n",
+        AV3A_LOGW("invalid nb_samples=%d (output=%d ch=%d)\n",
                nb_samples, output_bytes, s->channels);
         return avpkt->size;
     }
@@ -287,15 +292,14 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     frame->format = AV_SAMPLE_FMT_S16;
     int ret = ff_get_buffer(avctx, frame, 0);
     if (ret < 0) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: ff_get_buffer failed: %d\n", ret);
+        AV3A_LOGE("ff_get_buffer failed: %d\n", ret);
         return ret;
     }
 
     memcpy(frame->data[0], temp_output, output_bytes);
 
     *got_frame_ptr = 1;
-    av_log(avctx, AV_LOG_DEBUG,
-           "AV3A: decoded %d bytes → %d samples (%d ch, %d Hz)\n",
+    AV3A_LOGI("decoded %d bytes → %d samples (%d ch, %d Hz)\n",
            output_bytes, nb_samples, s->channels, s->sample_rate);
 
     return avpkt->size;
