@@ -710,18 +710,7 @@ jobs:
 
           if [ ! -f "$PC_FILE" ]; then
             echo "=== Creating fallback uavs3d.pc ==="
-            cat > "$PC_FILE" <<PCEOF
-prefix=/usr/local
-exec_prefix=\${prefix}
-libdir=\${exec_prefix}/lib
-includedir=\${prefix}/include
-
-Name: uavs3d
-Description: AVS3 decoder
-Version: 1.0.0
-Libs: -L\${libdir} -luavs3d
-Cflags: $UAVS3D_INC_DIR
-PCEOF
+            printf 'prefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${exec_prefix}/lib\nincludedir=${prefix}/include\n\nName: uavs3d\nDescription: AVS3 decoder\nVersion: 1.0.0\nLibs: -L${libdir} -luavs3d\nCflags: %s\n' "$UAVS3D_INC_DIR" > "$PC_FILE"
             echo "Created uavs3d.pc:"
             cat "$PC_FILE"
           else
