@@ -872,10 +872,43 @@ jobs:
           elif [ -f "$RIFF_C" ]; then
             echo "AV3A tag already in riff.c"
           fi
-          # Also try mpegts.c in case the tag is resolved there
+          # Also patch mpegts.c: map AV3A registration descriptor tag to AV_CODEC_ID_AV3A
+          # The MPEG-TS demuxer parses registration descriptors (tag 0x05) and sets
+          # codec_tag, but does NOT automatically map it to a codec_id.
+          # Without this patch, the stream shows as "Unknown: none (av3a / 0x61337661)"
+          # and no decoder is selected.
           MPEGTS_C="$FFMPEG_ABS/libavformat/mpegts.c"
-          if [ -f "$MPEGTS_C" ]; then
-            grep -c "av3a\|AV3A" "$MPEGTS_C" || echo "Note: AV3A not explicitly in mpegts.c (will use riff.c tags)"
+          if [ -f "$MPEGTS_C" ] && ! grep -q "AV_CODEC_ID_AV3A" "$MPEGTS_C"; then
+            echo "Patching mpegts.c to add AV3A registration descriptor mapping..."
+            # Find the line where codec_tag is set from the registration descriptor
+            # and add AV3A tag mapping after it. Use line-number based insertion.
+            # The registration descriptor handler sets: st->codecpar->codec_tag = bytestream_get_le32(&p);
+            TAG_LINE=$(grep -n 'codec_tag.*bytestream_get_le32' "$MPEGTS_C" | head -1 | cut -d: -f1)
+            if [ -n "$TAG_LINE" ]; then
+              echo "Found codec_tag assignment at line $TAG_LINE, inserting AV3A mapping..."
+              sed -i "${TAG_LINE}a\\
+                      if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; }" "$MPEGTS_C"
+            else
+              echo "WARNING: Could not find codec_tag assignment in mpegts.c, trying alternative pattern..."
+              # Try alternative: search for registration_descriptor comment
+              REG_LINE=$(grep -n 'registration_descriptor' "$MPEGTS_C" | head -1 | cut -d: -f1)
+              if [ -n "$REG_LINE" ]; then
+                echo "Found registration_descriptor at line $REG_LINE, inserting AV3A mapping after case block..."
+                # Insert after the case line — the next lines will contain the codec_tag assignment
+                # We add a fallback that checks for the tag after the case block
+                sed -i "${REG_LINE}a\\
+                    { if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; } }" "$MPEGTS_C"
+              fi
+            fi
+            if grep -q "AV_CODEC_ID_AV3A" "$MPEGTS_C"; then
+              echo "✓ Successfully patched mpegts.c with AV3A registration descriptor mapping"
+              grep -n "AV3A" "$MPEGTS_C"
+            else
+              echo "ERROR: Failed to patch mpegts.c with AV3A mapping!"
+              echo "This will cause AV3A audio to not be recognized in MPEG-TS streams."
+            fi
+          elif [ -f "$MPEGTS_C" ]; then
+            echo "AV3A mapping already present in mpegts.c"
           fi
 
           # 3f. Add codec descriptor
