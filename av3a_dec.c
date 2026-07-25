@@ -6,13 +6,21 @@
  * No compile-time dependency on libavs3a_decoder.so is needed.
  * The .so is shipped alongside libavcodec.so and loaded at runtime.
  *
- * API reverse-engineered from av3a_jni.cc (sggc/media repo):
- *   void* avs3_create_decoder(void);
- *   void  avs3_destroy_decoder(void* decoder);
- *   int   parse_header(void* decoder, const uint8_t* input, int input_size,
- *                       int first_frame, int* header_consumed, void* unknown);
- *   int   avs3_decode(void* decoder, const uint8_t* input, int input_size,
- *                      uint8_t* output, int* output_bytes, int* payload_consumed);
+ * API from av3a_jni.cc (sggc/media repo, codec-support branch):
+ * The avs3_decoder_interface.h header maps these via macros:
+ *   #define avs3_create_decoder   Avs3AllocDecoder
+ *   #define avs3_destroy_decoder  Avs3DecoderDestroy
+ *   #define parse_header          Avs3ParseBsFrameHeader
+ *   #define avs3_decode           Avs3Decode
+ *
+ * Actual exported symbols in libavs3a_decoder.so:
+ *   void* Avs3AllocDecoder(void);
+ *   void  Avs3DecoderDestroy(void* decoder);
+ *   int   Avs3ParseBsFrameHeader(void* decoder, const uint8_t* input, int input_size,
+ *                                int first_frame, int* header_consumed, void* unknown);
+ *   int   Avs3Decode(void* decoder, const uint8_t* input, int input_size,
+ *                    uint8_t* output, int* output_bytes, int* payload_consumed);
+ * Return values: AVS3_TRUE (success), AVS3_DATA_NOT_ENOUGH (need more data).
  *
  * The decoder struct has fields:
  *   int numChansOutput  (channel count, accessed after first decode)
@@ -96,10 +104,18 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
         return AVERROR_DECODER_NOT_FOUND;
     }
 
-    s->fn_create      = (av3a_create_fn)      dlsym(s->lib_handle, "avs3_create_decoder");
-    s->fn_destroy     = (av3a_destroy_fn)     dlsym(s->lib_handle, "avs3_destroy_decoder");
-    s->fn_parse_header = (av3a_parse_header_fn) dlsym(s->lib_handle, "parse_header");
-    s->fn_decode      = (av3a_decode_fn)      dlsym(s->lib_handle, "avs3_decode");
+    /* Use the actual exported symbol names from libavs3a_decoder.so.
+     * The avs3_decoder_interface.h header maps these via macros:
+     *   avs3_create_decoder  -> Avs3AllocDecoder
+     *   avs3_destroy_decoder -> Avs3DecoderDestroy
+     *   parse_header         -> Avs3ParseBsFrameHeader
+     *   avs3_decode          -> Avs3Decode
+     * We must dlsym the real names because the macro names don't exist
+     * as exported symbols in the .so file. */
+    s->fn_create      = (av3a_create_fn)      dlsym(s->lib_handle, "Avs3AllocDecoder");
+    s->fn_destroy     = (av3a_destroy_fn)     dlsym(s->lib_handle, "Avs3DecoderDestroy");
+    s->fn_parse_header = (av3a_parse_header_fn) dlsym(s->lib_handle, "Avs3ParseBsFrameHeader");
+    s->fn_decode      = (av3a_decode_fn)      dlsym(s->lib_handle, "Avs3Decode");
 
     if (!s->fn_create || !s->fn_destroy || !s->fn_parse_header || !s->fn_decode) {
         av_log(avctx, AV_LOG_ERROR, "AV3A: missing symbols in libavs3a_decoder.so\n");
@@ -110,7 +126,7 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
 
     s->decoder = s->fn_create();
     if (!s->decoder) {
-        av_log(avctx, AV_LOG_ERROR, "AV3A: avs3_create_decoder returned NULL\n");
+        av_log(avctx, AV_LOG_ERROR, "AV3A: Avs3AllocDecoder returned NULL\n");
         dlclose(s->lib_handle);
         s->lib_handle = NULL;
         return AVERROR_DECODER_NOT_FOUND;
