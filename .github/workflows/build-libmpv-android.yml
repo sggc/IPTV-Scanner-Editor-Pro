@@ -893,7 +893,7 @@ jobs:
             if [ -n "$TAG_LINE" ]; then
               echo "Found codec_tag assignment at line $TAG_LINE, inserting AV3A mapping..."
               sed -i "${TAG_LINE}a\\
-                      if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; av_channel_layout_default(\&st->codecpar->ch_layout, 2); }" "$MPEGTS_C"
+                      if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; st->codecpar->ch_layout.order = AV_CHANNEL_ORDER_NATIVE; st->codecpar->ch_layout.nb_channels = 2; st->codecpar->ch_layout.u.mask = 0x03; }" "$MPEGTS_C"
             else
               echo "WARNING: Could not find codec_tag assignment in mpegts.c, trying alternative pattern..."
               # Try alternative: search for registration_descriptor comment
@@ -902,8 +902,8 @@ jobs:
                 echo "Found registration_descriptor at line $REG_LINE, inserting AV3A mapping after case block..."
                 # Insert after the case line — the next lines will contain the codec_tag assignment
                 # We add a fallback that checks for the tag after the case block
-                sed -i "${REG_LINE}a\\
-                    { if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; av_channel_layout_default(\&st->codecpar->ch_layout, 2); } }" "$MPEGTS_C"
+                  sed -i "${REG_LINE}a\\
+                      { if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; st->codecpar->ch_layout.order = AV_CHANNEL_ORDER_NATIVE; st->codecpar->ch_layout.nb_channels = 2; st->codecpar->ch_layout.u.mask = 0x03; } }" "$MPEGTS_C"
               fi
             fi
             if grep -q "AV_CODEC_ID_AV3A" "$MPEGTS_C"; then
@@ -918,7 +918,7 @@ jobs:
             # Check if sample_rate default is already set, if not add it
             if ! grep -q "sample_rate.*48000.*AV3A\|AV3A.*sample_rate.*48000" "$MPEGTS_C"; then
               echo "Adding sample_rate default to existing AV3A mapping..."
-              sed -i 's/st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; }/st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; av_channel_layout_default(\&st->codecpar->ch_layout, 2); }/g' "$MPEGTS_C"
+              sed -i 's/st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; }/st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; st->codecpar->ch_layout.order = AV_CHANNEL_ORDER_NATIVE; st->codecpar->ch_layout.nb_channels = 2; st->codecpar->ch_layout.u.mask = 0x03; }/g' "$MPEGTS_C"
               grep -n "AV3A" "$MPEGTS_C"
             fi
           fi
