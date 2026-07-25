@@ -877,6 +877,12 @@ jobs:
           # codec_tag, but does NOT automatically map it to a codec_id.
           # Without this patch, the stream shows as "Unknown: none (av3a / 0x61337661)"
           # and no decoder is selected.
+          #
+          # CRITICAL: MPEG-TS does not carry sample_rate or channel count for AV3A.
+          # FFmpeg's avcodec_open2() rejects audio codecs with sample_rate <= 0
+          # BEFORE calling the decoder's init function. So we MUST set sensible
+          # defaults here to allow the codec to be opened. The decoder will later
+          # probe the actual values from the bitstream in av3a_decode_init().
           MPEGTS_C="$FFMPEG_ABS/libavformat/mpegts.c"
           if [ -f "$MPEGTS_C" ] && ! grep -q "AV_CODEC_ID_AV3A" "$MPEGTS_C"; then
             echo "Patching mpegts.c to add AV3A registration descriptor mapping..."
@@ -887,7 +893,7 @@ jobs:
             if [ -n "$TAG_LINE" ]; then
               echo "Found codec_tag assignment at line $TAG_LINE, inserting AV3A mapping..."
               sed -i "${TAG_LINE}a\\
-                      if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; }" "$MPEGTS_C"
+                      if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; av_channel_layout_default(\&st->codecpar->ch_layout, 2); }" "$MPEGTS_C"
             else
               echo "WARNING: Could not find codec_tag assignment in mpegts.c, trying alternative pattern..."
               # Try alternative: search for registration_descriptor comment
@@ -897,11 +903,11 @@ jobs:
                 # Insert after the case line — the next lines will contain the codec_tag assignment
                 # We add a fallback that checks for the tag after the case block
                 sed -i "${REG_LINE}a\\
-                    { if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; } }" "$MPEGTS_C"
+                    { if (st->codecpar->codec_tag == 0x61337661) { st->codecpar->codec_id = AV_CODEC_ID_AV3A; st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; av_channel_layout_default(\&st->codecpar->ch_layout, 2); } }" "$MPEGTS_C"
               fi
             fi
             if grep -q "AV_CODEC_ID_AV3A" "$MPEGTS_C"; then
-              echo "✓ Successfully patched mpegts.c with AV3A registration descriptor mapping"
+              echo "✓ Successfully patched mpegts.c with AV3A registration descriptor mapping (with default sample_rate=48000, stereo)"
               grep -n "AV3A" "$MPEGTS_C"
             else
               echo "ERROR: Failed to patch mpegts.c with AV3A mapping!"
@@ -909,7 +915,59 @@ jobs:
             fi
           elif [ -f "$MPEGTS_C" ]; then
             echo "AV3A mapping already present in mpegts.c"
+            # Check if sample_rate default is already set, if not add it
+            if ! grep -q "sample_rate.*48000.*AV3A\|AV3A.*sample_rate.*48000" "$MPEGTS_C"; then
+              echo "Adding sample_rate default to existing AV3A mapping..."
+              sed -i 's/st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; }/st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO; st->codecpar->sample_rate = 48000; st->codecpar->format = AV_SAMPLE_FMT_S16; av_channel_layout_default(\&st->codecpar->ch_layout, 2); }/g' "$MPEGTS_C"
+              grep -n "AV3A" "$MPEGTS_C"
+            fi
           fi
+
+          # 3e2. Patch decode.c: allow AV3A to open with sample_rate=0
+          # FFmpeg's ff_decode_preinit() (in libavcodec/decode.c) or avcodec_open2()
+          # (in libavcodec/avcodec.c) rejects audio codecs with sample_rate <= 0.
+          # This happens BEFORE the decoder's init() is called, so our av3a_decode_init()
+          # never gets a chance to set the sample_rate. We insert a default for AV3A
+          # before the check so the codec can be opened.
+          echo "=== Patching decode.c/avcodec.c for AV3A sample_rate default ==="
+          for DECODE_SRC in "$FFMPEG_ABS/libavcodec/decode.c" "$FFMPEG_ABS/libavcodec/avcodec.c"; do
+            if [ -f "$DECODE_SRC" ] && grep -q "Invalid sample rate" "$DECODE_SRC" && ! grep -q "AV_CODEC_ID_AV3A" "$DECODE_SRC"; then
+              echo "Found 'Invalid sample rate' check in $DECODE_SRC"
+              # Find the line with "Invalid sample rate" and look backwards for the if condition
+              ERR_LINE=$(grep -n "Invalid sample rate" "$DECODE_SRC" | head -1 | cut -d: -f1)
+              echo "Error message at line $ERR_LINE, searching for if condition..."
+              FOUND=0
+              for offset in 1 2 3 4; do
+                CHECK_LINE=$((ERR_LINE - offset))
+                [ "$CHECK_LINE" -lt 1 ] && break
+                LINE_CONTENT=$(sed -n "${CHECK_LINE}p" "$DECODE_SRC")
+                if echo "$LINE_CONTENT" | grep -qE 'if.*sample_rate'; then
+                  echo "Found sample_rate check at line $CHECK_LINE: $LINE_CONTENT"
+                  # Insert a default before the if line
+                  sed -i "${CHECK_LINE}i\\
+                          if (avctx->codec_id == AV_CODEC_ID_AV3A \&\& avctx->sample_rate <= 0) avctx->sample_rate = 48000;" "$DECODE_SRC"
+                  echo "✓ Inserted AV3A default sample_rate before check"
+                  FOUND=1
+                  break
+                fi
+              done
+              if [ "$FOUND" -eq 0 ]; then
+                echo "WARNING: Could not find if condition for sample_rate check, trying direct replacement..."
+                # Fallback: directly modify the condition
+                sed -i 's/avctx->sample_rate <= 0)/avctx->sample_rate <= 0 \&\& avctx->codec_id != AV_CODEC_ID_AV3A)/g' "$DECODE_SRC"
+                echo "Applied direct condition modification"
+              fi
+              # Verify
+              if grep -q "AV_CODEC_ID_AV3A" "$DECODE_SRC"; then
+                echo "✓ Successfully patched $DECODE_SRC for AV3A sample_rate"
+                grep -n "AV3A" "$DECODE_SRC"
+              else
+                echo "ERROR: Failed to patch $DECODE_SRC"
+              fi
+            elif [ -f "$DECODE_SRC" ] && grep -q "AV_CODEC_ID_AV3A" "$DECODE_SRC"; then
+              echo "AV3A patch already present in $DECODE_SRC"
+            fi
+          done
 
           # 3f. Add codec descriptor
           CODEC_DESC_C="$FFMPEG_ABS/libavcodec/codec_desc.c"
