@@ -859,10 +859,9 @@ jobs:
             elif grep -q 'extern.*ff_aac.*decoder;' "$ALLCODECS_C"; then
               sed -i '/extern.*ff_aac.*decoder;/a extern const FFCodec ff_av3a_decoder;' "$ALLCODECS_C"
               echo "Added extern ff_av3a_decoder after ff_aac decoder (pattern 2)"
-            # Pattern 3: any decoder extern at all
+            # Pattern 3: any decoder extern at all (use awk to avoid multi-line sed issues)
             elif grep -q 'extern.*FFCodec.*ff_.*_decoder;' "$ALLCODECS_C"; then
-              sed -i '0,/extern.*FFCodec.*ff_.*_decoder;/{/extern.*FFCodec.*ff_.*_decoder;/a extern const FFCodec ff_av3a_decoder;
-}' "$ALLCODECS_C"
+              awk '/extern.*FFCodec.*ff_.*_decoder;/{print; print "extern const FFCodec ff_av3a_decoder;"; next}1' "$ALLCODECS_C" > "$ALLCODECS_C.tmp" && mv "$ALLCODECS_C.tmp" "$ALLCODECS_C"
               echo "Added extern ff_av3a_decoder after first decoder extern (pattern 3)"
             # Pattern 4: last resort, insert at top of file after includes
             else
@@ -888,39 +887,26 @@ jobs:
           # step in ffmpeg.sh that directly patches codec_list.c.
           echo "=== Patching ffmpeg.sh to add codec_list.c post-configure patch ==="
           FFMPEG_SH="$GITHUB_WORKSPACE/mpv-android/buildscripts/scripts/ffmpeg.sh"
-          python3 -c "
-import re, sys
-with open(sys.argv[1], 'r') as f:
-    content = f.read()
-patch = r'''
-    # --- AV3A FAILSAFE: Patch codec_list.c to ensure ff_av3a_decoder is registered ---
-    if [ -f libavcodec/codec_list.c ] && ! grep -q ff_av3a_decoder libavcodec/codec_list.c; then
-        sed -i 's/\\(const FFCodec \\* const codec_list\\[\\] = {\\)/\\1\\n    \\&ff_av3a_decoder,/' libavcodec/codec_list.c
-        echo 'PATCHED codec_list.c to add ff_av3a_decoder (FAILSAFE)'
-        grep -n av3a libavcodec/codec_list.c || echo 'WARNING: av3a still not in codec_list.c!'
-    elif [ -f libavcodec/codec_list.c ]; then
-        echo 'codec_list.c already has ff_av3a_decoder'
-    else
-        echo 'WARNING: codec_list.c not found, cannot patch'
-    fi
-    # --- End AV3A FAILSAFE ---
-
-'''
-lines = content.split('\\n')
-new_lines = []
-inserted = False
-for line in lines:
-    if not inserted and re.match(r'^\\s*make\\s', line):
-        new_lines.append(patch)
-        inserted = True
-    new_lines.append(line)
-if not inserted:
-    print('WARNING: Could not find make in ffmpeg.sh')
-else:
-    print('Inserted codec_list.c FAILSAFE patch before make in ffmpeg.sh')
-with open(sys.argv[1], 'w') as f:
-    f.write('\\n'.join(new_lines))
-" "$FFMPEG_SH"
+          # Write the codec_list.c FAILSAFE patch to a script file
+          echo '#!/bin/bash' > /tmp/av3a_cl_patch.sh
+          echo '# AV3A FAILSAFE: Patch codec_list.c to ensure ff_av3a_decoder is registered' >> /tmp/av3a_cl_patch.sh
+          echo 'if [ -f libavcodec/codec_list.c ] && ! grep -q ff_av3a_decoder libavcodec/codec_list.c; then' >> /tmp/av3a_cl_patch.sh
+          echo "    sed -i 's/\\(const FFCodec \\* const codec_list\\[\\] = {\\)/\\1\\n    \\&ff_av3a_decoder,/' libavcodec/codec_list.c" >> /tmp/av3a_cl_patch.sh
+          echo "    echo 'PATCHED codec_list.c to add ff_av3a_decoder (FAILSAFE)'" >> /tmp/av3a_cl_patch.sh
+          echo "    grep -n av3a libavcodec/codec_list.c || echo 'WARNING: av3a still not in codec_list.c!'" >> /tmp/av3a_cl_patch.sh
+          echo 'elif [ -f libavcodec/codec_list.c ]; then' >> /tmp/av3a_cl_patch.sh
+          echo "    echo 'codec_list.c already has ff_av3a_decoder'" >> /tmp/av3a_cl_patch.sh
+          echo 'else' >> /tmp/av3a_cl_patch.sh
+          echo "    echo 'WARNING: codec_list.c not found, cannot patch'" >> /tmp/av3a_cl_patch.sh
+          echo 'fi' >> /tmp/av3a_cl_patch.sh
+          chmod +x /tmp/av3a_cl_patch.sh
+          echo "=== Patch script contents ==="
+          cat /tmp/av3a_cl_patch.sh
+          # Insert 'source /tmp/av3a_cl_patch.sh' before the first 'make' line in ffmpeg.sh
+          # Use awk to find the first line starting with 'make' and insert before it
+          awk '/^[[:space:]]*make/ && !done {print "    source /tmp/av3a_cl_patch.sh"; done=1} {print}' "$FFMPEG_SH" > "$FFMPEG_SH.tmp" && mv "$FFMPEG_SH.tmp" "$FFMPEG_SH"
+          echo "=== ffmpeg.sh after patching (make section) ==="
+          grep -n -A2 -B2 "av3a_cl_patch\|make" "$FFMPEG_SH" | head -20
 
           # 3d. Add to Makefile
           MAKEFILE="$FFMPEG_ABS/libavcodec/Makefile"
