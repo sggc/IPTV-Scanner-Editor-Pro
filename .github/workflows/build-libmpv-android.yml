@@ -749,6 +749,14 @@ jobs:
               "    FFAMediaFormat *fmt;",
               "    const char *codec_mime = NULL;",
               "",
+              "    /* Ensure s->ctx is allocated (might be NULL if init failed early) */",
+              "    if (!s->ctx) {",
+              "        s->ctx = av_mallocz(sizeof(*s->ctx));",
+              "        if (!s->ctx) return AVERROR(ENOMEM);",
+              "        s->ctx->delay_flush = s->delay_flush;",
+              "        s->ctx->use_ndk_codec = s->use_ndk_codec;",
+              "    }",
+              "",
               "    if (s->buffered_pkt.size <= 0) {",
               "        ret = ff_decode_get_packet(avctx, &s->buffered_pkt);",
               "        if (ret < 0)",
@@ -902,6 +910,31 @@ jobs:
           else:
               print("WARNING: cannot find decode_close line, skipping")
 
+          # 6. Patch done: label to catch ALL init failures (not just ff_mediacodec_dec_init)
+          # This catches errors from h264_set_extradata() and other early failures
+          done_old = (
+              "    if (ret < 0) {" + NL +
+              "        mediacodec_decode_close(avctx);" + NL +
+              "    }" + NL +
+              "    return ret;"
+          )
+          done_new = (
+              "    if (ret < 0) {" + NL +
+              "        /* DELAYED_INIT: catch ALL init failures */" + NL +
+              "        av_log(avctx, AV_LOG_INFO, \"MediaCodec init failed (ret=%d), deferring until SPS/PPS found in stream\\n\", ret);" + NL +
+              "        if (s->ctx)" + NL +
+              "            av_freep(&s->ctx);" + NL +
+              "        s->delayed_init = 1;" + NL +
+              "        ret = 0;" + NL +
+              "    }" + NL +
+              "    return ret;"
+          )
+          if done_old in src:
+              src = src.replace(done_old, done_new, 1)
+              print("OK: patched done: label to catch all init failures")
+          else:
+              print("WARNING: cannot find done: label, skipping")
+
           with open(f, "w") as fh:
               fh.write(src)
 
@@ -911,6 +944,7 @@ jobs:
           assert "delayed_init" in verify
           assert "mediacodec_try_delayed_init" in verify
           assert "MediaCodec configure failed" in verify
+          assert "MediaCodec init failed" in verify
           assert "Delayed init: found SPS" in verify
           print("All verifications passed!")
           PYEOF
