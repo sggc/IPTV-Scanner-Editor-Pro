@@ -910,7 +910,7 @@ jobs:
               verify = fh.read()
           assert "delayed_init" in verify
           assert "mediacodec_try_delayed_init" in verify
-          assert "No extradata, deferring" in verify
+          assert "MediaCodec configure failed" in verify
           assert "Delayed init: found SPS" in verify
           print("All verifications passed!")
           PYEOF
