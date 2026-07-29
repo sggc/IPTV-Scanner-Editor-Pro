@@ -1152,6 +1152,7 @@ jobs:
           # Insert 'source /tmp/av3a_cl_patch.sh' before the first 'make' line in ffmpeg.sh
           # Use awk to find the first line starting with 'make' and insert before it
           awk '/^[[:space:]]*make/ && !done {print "    source /tmp/av3a_cl_patch.sh"; done=1} {print}' "$FFMPEG_SH" > "$FFMPEG_SH.tmp" && mv "$FFMPEG_SH.tmp" "$FFMPEG_SH"
+          chmod +x "$FFMPEG_SH"
           echo "=== ffmpeg.sh after patching (make section) ==="
           grep -n -A2 -B2 "av3a_cl_patch\|make" "$FFMPEG_SH" | head -20
 
