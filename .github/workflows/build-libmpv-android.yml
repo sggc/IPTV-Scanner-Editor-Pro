@@ -665,6 +665,226 @@ jobs:
           fi
           ls -la libavcodec/libcavs* libavcodec/dradec* 2>/dev/null || { echo "ERROR: CAVS patch failed"; exit 1; }
 
+      - name: Patch mediacodecdec.c — delayed init for H.264 without extradata
+        run: |
+          cd mpv-android/buildscripts
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          [ -z "$FFMPEG_DIR" ] && FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          MCD_C="$FFMPEG_DIR/libavcodec/mediacodecdec.c"
+          [ -f "$MCD_C" ] || { echo "ERROR: mediacodecdec.c not found"; exit 1; }
+          echo "=== Patching mediacodecdec.c for delayed init ==="
+
+          python3 << 'PYEOF'
+          import re
+
+          f = "deps/ffmpeg/libavcodec/mediacodecdec.c"
+          # Find the file
+          import os, glob
+          candidates = []
+          for root in ["deps/ffmpeg", "sources/ffmpeg"]:
+              p = os.path.join(root, "libavcodec", "mediacodecdec.c")
+              if os.path.exists(p):
+                  candidates.append(p)
+          if not candidates:
+              # Search more broadly
+              for root, dirs, files in os.walk("."):
+                  if "mediacodecdec.c" in files and ".git" not in root:
+                      candidates.append(os.path.join(root, "mediacodecdec.c"))
+                      break
+          if not candidates:
+              print("ERROR: mediacodecdec.c not found")
+              exit(1)
+          f = candidates[0]
+          print(f"Patching: {f}")
+
+          with open(f, "r") as fh:
+              src = fh.read()
+
+          # === 1. Add delayed_init field to MediaCodecH264DecContext ===
+          old = "    int operating_rate;\n} MediaCodecH264DecContext;"
+          new = "    int operating_rate;\n    int delayed_init;\n} MediaCodecH264DecContext;"
+          if old not in src:
+              print("ERROR: cannot find operating_rate in struct")
+              exit(1)
+          src = src.replace(old, new, 1)
+          print("OK: added delayed_init field")
+
+          # === 2. In mediacodec_decode_init: skip ff_mediacodec_dec_init when extradata is empty ===
+          old = "    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {"
+          new = """    /* DELAYED_INIT: If extradata is empty (e.g. RTSP MPEG-TS without sprop-parameter-sets
+     * in SDP), MediaCodec.configure() will fail because csd-0/csd-1 are not set.
+     * Skip configure here; the decoder will be configured later when SPS/PPS
+     * is found in the stream data by mediacodec_try_delayed_init(). */
+    if (avctx->extradata_size == 0) {
+        av_log(avctx, AV_LOG_INFO, "No extradata, deferring MediaCodec configure until SPS/PPS found in stream\\n");
+        s->delayed_init = 1;
+        goto done;
+    }
+    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {"""
+          if old not in src:
+              print("ERROR: cannot find ff_mediacodec_dec_init call")
+              exit(1)
+          src = src.replace(old, new, 1)
+          print("OK: added delayed_init skip in decode_init")
+
+          # === 3. Add mediacodec_try_delayed_init() function before mediacodec_receive_frame ===
+          delayed_func = r'''
+/* DELAYED_INIT: Scan Annex B packet data for SPS (NAL type 7) and PPS (NAL type 8).
+ * When both are found, create a MediaFormat with csd-0/csd-1 and configure MediaCodec.
+ * Returns 0 on success, AVERROR(EAGAIN) if SPS/PPS not yet found. */
+static int mediacodec_try_delayed_init(AVCodecContext *avctx, MediaCodecH264DecContext *s)
+{
+    int ret;
+    const uint8_t *data;
+    int size;
+    const uint8_t *sps_ptr = NULL, *pps_ptr = NULL;
+    int sps_size = 0, pps_size = 0;
+    int i;
+    FFAMediaFormat *fmt;
+    const char *codec_mime = NULL;
+
+    /* Need a packet to scan */
+    if (s->buffered_pkt.size <= 0) {
+        ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
+        if (ret < 0)
+            return ret;
+    }
+
+    data = s->buffered_pkt.data;
+    size = s->buffered_pkt.size;
+
+    /* Scan for SPS (NAL type 7) and PPS (NAL type 8) in Annex B format */
+    for (i = 0; i < size - 4; i++) {
+        /* Look for start code 00 00 00 01 */
+        if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
+            int nal_type = data[i+4] & 0x1F;
+            int j;
+            /* Find end of this NAL (next start code or end of data) */
+            for (j = i + 5; j < size - 3; j++) {
+                if (data[j] == 0 && data[j+1] == 0 && data[j+2] == 1)
+                    break;
+            }
+            if (j >= size - 3)
+                j = size; /* NAL extends to end of data */
+
+            if (nal_type == 7 && !sps_ptr) {
+                /* SPS */
+                sps_ptr = data + i;
+                sps_size = j - i;
+            } else if (nal_type == 8 && !pps_ptr) {
+                /* PPS */
+                pps_ptr = data + i;
+                pps_size = j - i;
+            }
+        }
+    }
+
+    if (!sps_ptr || !pps_ptr) {
+        av_log(avctx, AV_LOG_DEBUG, "Delayed init: SPS/PPS not found in packet yet, dropping\\n");
+        av_packet_unref(&s->buffered_pkt);
+        return AVERROR(EAGAIN);
+    }
+
+    av_log(avctx, AV_LOG_INFO, "Delayed init: found SPS (%d bytes) and PPS (%d bytes), configuring MediaCodec\\n",
+           sps_size, pps_size);
+
+    /* Determine codec mime from codec_id */
+    switch (avctx->codec_id) {
+    case AV_CODEC_ID_H264:  codec_mime = "video/avc";  break;
+    case AV_CODEC_ID_HEVC:  codec_mime = "video/hevc"; break;
+    default:
+        av_log(avctx, AV_LOG_ERROR, "Delayed init: unsupported codec_id\\n");
+        return AVERROR(EINVAL);
+    }
+
+    fmt = ff_AMediaFormat_new(s->use_ndk_codec);
+    if (!fmt) {
+        av_log(avctx, AV_LOG_ERROR, "Delayed init: Failed to create media format\\n");
+        return AVERROR_EXTERNAL;
+    }
+
+    ff_AMediaFormat_setString(fmt, "mime", codec_mime);
+    ff_AMediaFormat_setInt32(fmt, "width", avctx->width);
+    ff_AMediaFormat_setInt32(fmt, "height", avctx->height);
+    ff_AMediaFormat_setBuffer(fmt, "csd-0", (void*)sps_ptr, sps_size);
+    ff_AMediaFormat_setBuffer(fmt, "csd-1", (void*)pps_ptr, pps_size);
+
+    ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, fmt);
+    ff_AMediaFormat_delete(fmt);
+
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Delayed init: MediaCodec configure failed, ret=%d\\n", ret);
+        s->ctx = NULL;
+        return ret;
+    }
+
+    s->delayed_init = 0;
+    av_log(avctx, AV_LOG_INFO, "Delayed init: MediaCodec configured successfully, codec=%s\\n", s->ctx->codec_name);
+    return 0;
+}
+
+'''
+          old_func = "static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame) {"
+          if old_func not in src:
+              print("ERROR: cannot find mediacodec_receive_frame")
+              exit(1)
+          src = src.replace(old_func, delayed_func + old_func, 1)
+          print("OK: added mediacodec_try_delayed_init function")
+
+          # === 4. In mediacodec_receive_frame: call delayed init at the beginning ===
+          old = "    /* In delay_flush mode, wait until the user has released or rendered all retained frames. */"
+          new = """    /* DELAYED_INIT: If MediaCodec is not yet configured (extradata was empty),
+     * scan incoming packets for SPS/PPS and configure MediaCodec when found. */
+    if (s->delayed_init) {
+        ret = mediacodec_try_delayed_init(avctx, s);
+        if (ret < 0)
+            return ret;
+    }
+
+    /* In delay_flush mode, wait until the user has released or rendered all retained frames. */"""
+          if old not in src:
+              print("ERROR: cannot find delay_flush comment in receive_frame")
+              exit(1)
+          src = src.replace(old, new, 1)
+          print("OK: added delayed_init call in receive_frame")
+
+          # === 5. In mediacodec_decode_close: handle delayed_init (ctx may not have codec) ===
+          old = """static av_cold int mediacodec_decode_close(AVCodecContext *avctx) {
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    ff_mediacodec_dec_close(avctx, s->ctx);"""
+          new = """static av_cold int mediacodec_decode_close(AVCodecContext *avctx) {
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    if (s->delayed_init) {
+        /* MediaCodec was never configured, just free the context */
+        av_freep(&s->ctx);
+    } else {
+        ff_mediacodec_dec_close(avctx, s->ctx);
+    }"""
+          if old not in src:
+              print("WARNING: cannot find mediacodec_decode_close for patching, skipping close fix")
+          else:
+              src = src.replace(old, new, 1)
+              print("OK: patched decode_close for delayed_init")
+
+          with open(f, "w") as fh:
+              fh.write(src)
+
+          print("=== mediacodecdec.c patched successfully ===")
+          # Verify patches
+          with open(f, "r") as fh:
+              verify = fh.read()
+          assert "delayed_init" in verify, "delayed_init not found in patched file"
+          assert "mediacodec_try_delayed_init" in verify, "mediacodec_try_delayed_init not found"
+          assert "No extradata, deferring" in verify, "defer message not found"
+          assert "Delayed init: found SPS" in verify, "SPS found message not found"
+          print("All verifications passed!")
+          PYEOF
+
+          echo "=== mediacodecdec.c patch complete ==="
+
       - name: Build libuavs3d (AVS3 video decoder library)
         run: |
           cd "$GITHUB_WORKSPACE"
