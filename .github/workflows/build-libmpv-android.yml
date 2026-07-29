@@ -818,51 +818,83 @@ jobs:
           ]
           delayed_func = NL.join(func_lines)
 
-          old_func = "static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame) {"
-          if old_func not in src:
+          # Fuzzy match: find 'mediacodec_receive_frame' then search backwards for 'static'
+          idx = src.find('mediacodec_receive_frame')
+          if idx < 0:
               print("ERROR: cannot find mediacodec_receive_frame")
               sys.exit(1)
-          src = src.replace(old_func, delayed_func + old_func, 1)
+          func_start = src.rfind('static', 0, idx)
+          if func_start < 0:
+              print("ERROR: cannot find 'static' before mediacodec_receive_frame")
+              sys.exit(1)
+          src = src[:func_start] + delayed_func + src[func_start:]
           print("OK: added mediacodec_try_delayed_init function")
 
           # 4. Call delayed init at beginning of receive_frame
+          # Fuzzy match: find the delay_flush comment or the is_flushing call
           old4 = "    /* In delay_flush mode, wait until the user has released or rendered all retained frames. */"
-          new4 = (
-              "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
-              "    if (s->delayed_init) {" + NL +
-              "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
-              "        if (ret < 0)" + NL +
-              "            return ret;" + NL +
-              "    }" + NL +
-              "" + NL +
-              "    /* In delay_flush mode, wait until the user has released or rendered all retained frames. */"
-          )
-          if old4 not in src:
-              print("ERROR: cannot find delay_flush comment")
-              sys.exit(1)
-          src = src.replace(old4, new4, 1)
-          print("OK: added delayed_init call in receive_frame")
+          if old4 in src:
+              new4 = (
+                  "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
+                  "    if (s->delayed_init) {" + NL +
+                  "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
+                  "        if (ret < 0)" + NL +
+                  "            return ret;" + NL +
+                  "    }" + NL +
+                  "" + NL +
+                  "    /* In delay_flush mode, wait until the user has released or rendered all retained frames. */"
+              )
+              src = src.replace(old4, new4, 1)
+              print("OK: added delayed_init call in receive_frame (exact match)")
+          else:
+              # Fallback: find ff_mediacodec_dec_is_flushing and insert before its line
+              idx4 = src.find('ff_mediacodec_dec_is_flushing')
+              if idx4 < 0:
+                  # Fallback 2: find first 'MediaCodecH264DecContext *s =' in receive_frame area
+                  idx4 = src.find('MediaCodecH264DecContext *s = avctx->priv_data;', idx)
+                  if idx4 < 0:
+                      print("ERROR: cannot find insertion point in receive_frame")
+                      sys.exit(1)
+                  # Insert after the priv_data line
+                  line_end4 = src.find(NL, idx4) + 1
+                  insert_code = (
+                      "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
+                      "    if (s->delayed_init) {" + NL +
+                      "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
+                      "        if (ret < 0)" + NL +
+                      "            return ret;" + NL +
+                      "    }" + NL
+                  )
+                  src = src[:line_end4] + insert_code + src[line_end4:]
+                  print("OK: added delayed_init call in receive_frame (fallback after priv_data)")
+              else:
+                  line_start4 = src.rfind(NL, 0, idx4) + 1
+                  insert_code = (
+                      "    /* DELAYED_INIT: scan packets for SPS/PPS if not yet configured */" + NL +
+                      "    if (s->delayed_init) {" + NL +
+                      "        ret = mediacodec_try_delayed_init(avctx, s);" + NL +
+                      "        if (ret < 0)" + NL +
+                      "            return ret;" + NL +
+                      "    }" + NL + NL
+                  )
+                  src = src[:line_start4] + insert_code + src[line_start4:]
+                  print("OK: added delayed_init call in receive_frame (before is_flushing)")
 
           # 5. Patch decode_close
-          old5 = (
-              "static av_cold int mediacodec_decode_close(AVCodecContext *avctx) {" + NL +
-              "    MediaCodecH264DecContext *s = avctx->priv_data;" + NL +
-              "    ff_mediacodec_dec_close(avctx, s->ctx);"
-          )
-          new5 = (
-              "static av_cold int mediacodec_decode_close(AVCodecContext *avctx) {" + NL +
-              "    MediaCodecH264DecContext *s = avctx->priv_data;" + NL +
-              "    if (s->delayed_init) {" + NL +
-              "        av_freep(&s->ctx);" + NL +
-              "    } else {" + NL +
-              "        ff_mediacodec_dec_close(avctx, s->ctx);" + NL +
-              "    }"
-          )
-          if old5 in src:
-              src = src.replace(old5, new5, 1)
+          # Fuzzy match for decode_close: find 'ff_mediacodec_dec_close(avctx, s->ctx);'
+          close_line = "    ff_mediacodec_dec_close(avctx, s->ctx);"
+          if close_line in src:
+              new_close = (
+                  "    if (s->delayed_init) {" + NL +
+                  "        av_freep(&s->ctx);" + NL +
+                  "    } else {" + NL +
+                  "        ff_mediacodec_dec_close(avctx, s->ctx);" + NL +
+                  "    }"
+              )
+              src = src.replace(close_line, new_close, 1)
               print("OK: patched decode_close")
           else:
-              print("WARNING: cannot find decode_close, skipping")
+              print("WARNING: cannot find decode_close line, skipping")
 
           with open(f, "w") as fh:
               fh.write(src)
