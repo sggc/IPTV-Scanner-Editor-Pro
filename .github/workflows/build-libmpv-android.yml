@@ -1446,14 +1446,15 @@ jobs:
             echo "WARNING: codec_list.c not found, skipping check"
           fi
           # CRITICAL: Check that the AV3A codec name string is in the binary
-          # The ff_av3a_decoder struct has .p.name = "av3a" and .p.long_name
-          # = "AVS3-P3 Audio Vivid (AV3A)". If the struct is in the .so,
-          # these strings must be present.
+          # Note: --enable-small causes NULL_IF_CONFIG_SMALL() to return NULL,
+          # so the long_name "AVS3-P3 Audio Vivid (AV3A)" is NOT compiled in.
+          # Instead, check for the .name field "av3a" which is always present,
+          # or the ff_av3a_decoder symbol.
           echo "=== Checking libavcodec.so for AV3A codec strings ==="
-          if strings "$AVCODEC_SO" | grep -q "AVS3-P3"; then
-            echo "✓ AVS3-P3 string found in libavcodec.so — ff_av3a_decoder struct is linked"
+          if nm -D "$AVCODEC_SO" 2>/dev/null | grep -q "ff_av3a_decoder" || strings "$AVCODEC_SO" | grep -q "av3a"; then
+            echo "✓ AV3A decoder found in libavcodec.so (ff_av3a_decoder symbol or av3a string present)"
           else
-            echo "FATAL: AVS3-P3 string NOT found in libavcodec.so!"
+            echo "FATAL: AV3A decoder NOT found in libavcodec.so!"
             echo "This means ff_av3a_decoder was stripped from the binary."
             echo "The codec_list.c patching did not work."
             strings "$AVCODEC_SO" | grep -i "av3a" || echo "(no av3a strings at all)"
