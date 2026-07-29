@@ -712,15 +712,21 @@ jobs:
           print("OK: added delayed_init field")
 
           # 2. Skip ff_mediacodec_dec_init when extradata is empty
-          old2 = "    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {"
-          new2 = (
-              "    /* DELAYED_INIT: If extradata is empty, defer MediaCodec configure. */" + NL +
-              "    if (avctx->extradata_size == 0) {" + NL +
-              "        av_log(avctx, AV_LOG_INFO, \"No extradata, deferring MediaCodec configure until SPS/PPS found in stream\\n\");" + NL +
-              "        s->delayed_init = 1;" + NL +
+          old2 = (
+              "    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {" + NL +
+              "        s->ctx = NULL;" + NL +
               "        goto done;" + NL +
-              "    }" + NL +
-              "    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {"
+              "    }"
+          )
+          new2 = (
+              "    if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {" + NL +
+              "        /* DELAYED_INIT: configure failed (no valid SPS/PPS in extradata)." + NL +
+              "         * Defer MediaCodec configure until SPS/PPS found in stream data. */" + NL +
+              "        av_log(avctx, AV_LOG_INFO, \"MediaCodec configure failed (ret=%d), deferring until SPS/PPS found in stream\\n\", ret);" + NL +
+              "        s->delayed_init = 1;" + NL +
+              "        ret = 0;" + NL +
+              "        goto done;" + NL +
+              "    }"
           )
           if old2 not in src:
               print("ERROR: cannot find ff_mediacodec_dec_init call")
