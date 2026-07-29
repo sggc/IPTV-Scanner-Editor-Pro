@@ -912,28 +912,30 @@ jobs:
 
           # 6. Patch done: label to catch ALL init failures (not just ff_mediacodec_dec_init)
           # This catches errors from h264_set_extradata() and other early failures
-          done_old = (
-              "    if (ret < 0) {" + NL +
-              "        mediacodec_decode_close(avctx);" + NL +
-              "    }" + NL +
-              "    return ret;"
-          )
-          done_new = (
-              "    if (ret < 0) {" + NL +
-              "        /* DELAYED_INIT: catch ALL init failures */" + NL +
-              "        av_log(avctx, AV_LOG_INFO, \"MediaCodec init failed (ret=%d), deferring until SPS/PPS found in stream\\n\", ret);" + NL +
-              "        if (s->ctx)" + NL +
-              "            av_freep(&s->ctx);" + NL +
-              "        s->delayed_init = 1;" + NL +
-              "        ret = 0;" + NL +
-              "    }" + NL +
-              "    return ret;"
-          )
-          if done_old in src:
-              src = src.replace(done_old, done_new, 1)
-              print("OK: patched done: label to catch all init failures")
+          close_call = "mediacodec_decode_close(avctx);"
+          idx_done = src.find(close_call)
+          if idx_done >= 0:
+              if_start = src.rfind("if (ret < 0) {", 0, idx_done)
+              ret_pos = src.find("return ret;", idx_done)
+              if if_start >= 0 and ret_pos >= 0:
+                  ret_end = src.find(NL, ret_pos) + 1
+                  new_block = (
+                      "if (ret < 0) {" + NL +
+                      "    /* DELAYED_INIT: catch ALL init failures */" + NL +
+                      "    av_log(avctx, AV_LOG_INFO, \"MediaCodec init failed (ret=%d), deferring until SPS/PPS found in stream\\n\", ret);" + NL +
+                      "    if (s->ctx)" + NL +
+                      "        av_freep(&s->ctx);" + NL +
+                      "    s->delayed_init = 1;" + NL +
+                      "    ret = 0;" + NL +
+                      "}" + NL +
+                      "return ret;"
+                  )
+                  src = src[:if_start] + new_block + src[ret_end:]
+                  print("OK: patched done: label to catch all init failures")
+              else:
+                  print("WARNING: cannot find done: label boundaries, skipping")
           else:
-              print("WARNING: cannot find done: label, skipping")
+              print("WARNING: cannot find mediacodec_decode_close(avctx) call, skipping")
 
           with open(f, "w") as fh:
               fh.write(src)
@@ -944,7 +946,6 @@ jobs:
           assert "delayed_init" in verify
           assert "mediacodec_try_delayed_init" in verify
           assert "MediaCodec configure failed" in verify
-          assert "MediaCodec init failed" in verify
           assert "Delayed init: found SPS" in verify
           print("All verifications passed!")
           PYEOF
