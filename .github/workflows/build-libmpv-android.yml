@@ -134,6 +134,18 @@ jobs:
           # === 4. Patch ffmpeg.sh ===
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
           sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os --extra-ldflags=-llog/' scripts/ffmpeg.sh
+          # CRITICAL: Force-enable pthreads for FFmpeg.
+          # Without this, FFmpeg's configure may fail to detect pthread_cancel
+          # in Android NDK cross-compilation, which disables the UDP circular
+          # buffer (the "pthread support is required" warning).
+          # --enable-pthreads forces FFmpeg to use pthreads regardless of
+          # auto-detection results.
+          if ! grep -q 'enable-pthreads' scripts/ffmpeg.sh; then
+            sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2} --enable-pthreads/' scripts/ffmpeg.sh
+            echo "=== Added --enable-pthreads to ffmpeg.sh ==="
+          fi
+          echo "=== ffmpeg.sh pthread-related flags ==="
+          grep -n "pthread" scripts/ffmpeg.sh || echo "(no pthread flags found)"
 
           # === 4c. Decoder list ===
           # NOTE: --enable-libuavs3d and --enable-libdavs2 are included here
@@ -1412,8 +1424,22 @@ jobs:
 
           # Patch setup_prefix() to add [properties] section in crossfile
           if ! grep -q "has_function_pthread_create" "$BUILDALL_SH"; then
-            # Insert [properties] section before [host_machine] in the crossfile template
-            sed -i '/^\[host_machine\]/i\[properties]\nhas_function_pthread_create = true\n' "$BUILDALL_SH"
+            # Write Python patch script using printf (avoids YAML heredoc indentation issues)
+            printf '%s\n' \
+              'import sys' \
+              'with open(sys.argv[1], "r") as f:' \
+              '    content = f.read()' \
+              'old = "[host_machine]"' \
+              'new = "[properties]\nhas_function_pthread_create = true\n\n[host_machine]"' \
+              'if old in content:' \
+              '    content = content.replace(old, new, 1)' \
+              '    with open(sys.argv[1], "w") as f:' \
+              '        f.write(content)' \
+              '    print("PATCHED: Added [properties] section before [host_machine]")' \
+              'else:' \
+              '    print("ERROR: [host_machine] not found in buildall.sh")' \
+              '    sys.exit(1)' > /tmp/patch_crossfile.py
+            python3 /tmp/patch_crossfile.py "$BUILDALL_SH"
             echo "=== Patched buildall.sh to add [properties] to crossfile.txt ==="
           else
             echo "=== buildall.sh already patched ==="
@@ -1421,7 +1447,7 @@ jobs:
 
           # Verify the patch
           echo "=== Verifying buildall.sh patch ==="
-          grep -A2 "\[properties\]" "$BUILDALL_SH" || echo "WARNING: [properties] not found in buildall.sh"
+          grep -B1 -A2 "has_function_pthread_create" "$BUILDALL_SH" || echo "WARNING: has_function_pthread_create not found in buildall.sh"
 
           echo "=== buildall.sh setup_prefix crossfile section ==="
           sed -n '/cat >"\$prefix_dir\/crossfile.tmp"/,/CROSSFILE/p' "$BUILDALL_SH"
@@ -1453,6 +1479,38 @@ jobs:
               echo "=== crossfile.txt contents ==="
               cat "$CF"
             fi
+          fi
+
+          # CRITICAL: Verify FFmpeg config.h has pthread support enabled
+          echo "=== Checking FFmpeg config.h for pthread support ==="
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -f "$c/ffbuild/config.mak" ] && FFMPEG_DIR="$c" && break
+          done
+          if [ -n "$FFMPEG_DIR" ]; then
+            CONFIG_H=""
+            for f in "$FFMPEG_DIR/config.h" "$FFMPEG_DIR/ffbuild/config.h"; do
+              [ -f "$f" ] && CONFIG_H="$f" && break
+            done
+            if [ -n "$CONFIG_H" ]; then
+              echo "Checking $CONFIG_H for pthread flags..."
+              if grep -q "CONFIG_PTHREADS 1" "$CONFIG_H"; then
+                echo "OK: CONFIG_PTHREADS=1"
+              else
+                echo "ERROR: CONFIG_PTHREADS is NOT 1! Pthreads not enabled in FFmpeg!"
+                grep "PTHREAD" "$CONFIG_H" || echo "(no PTHREAD entries in config.h)"
+              fi
+              if grep -q "HAVE_PTHREAD_CANCEL 1" "$CONFIG_H"; then
+                echo "OK: HAVE_PTHREAD_CANCEL=1 — UDP circular buffer will work"
+              else
+                echo "WARNING: HAVE_PTHREAD_CANCEL is NOT 1 — UDP circular buffer may not work"
+                grep "PTHREAD_CANCEL" "$CONFIG_H" || echo "(no PTHREAD_CANCEL entries in config.h)"
+              fi
+            else
+              echo "WARNING: config.h not found in $FFMPEG_DIR"
+            fi
+          else
+            echo "WARNING: FFmpeg source dir not found for config.h check"
           fi
 
           find . -name "*.so" -ls 2>/dev/null || true
