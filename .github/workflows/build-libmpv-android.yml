@@ -185,7 +185,23 @@ jobs:
         run: |
           cd mpv-android/buildscripts
           export IN_CI=1
-          ./download.sh
+          # Retry download up to 3 times to handle transient 502/503 errors
+          # from GitLab/GitHub servers
+          for attempt in 1 2 3; do
+            echo "=== Download attempt $attempt ==="
+            if ./download.sh; then
+              echo "=== Download succeeded on attempt $attempt ==="
+              break
+            else
+              echo "=== Download failed on attempt $attempt ==="
+              if [ $attempt -eq 3 ]; then
+                echo "ERROR: Download failed after 3 attempts"
+                exit 1
+              fi
+              echo "Waiting 10 seconds before retry..."
+              sleep 10
+            fi
+          done
           echo "=== davs2 source check ==="
           ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 not found"; exit 1; }
 
