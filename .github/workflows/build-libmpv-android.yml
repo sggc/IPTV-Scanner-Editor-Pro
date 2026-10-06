@@ -238,14 +238,31 @@ jobs:
           job_returns_ptr = bool(tp_job_m) and '*' in tp_job_m.group(1)
           print("threadpool job typedef returns void*: %s" % job_returns_ptr)
           if job_returns_ptr:
-              run_body = '    g_sync_result = func ? func(arg1, arg2) : NULL;   /* SYNC_RESULT */' + nl
-              wait_body = ('    void *r = g_sync_result; g_sync_result = NULL;   /* SYNC_RESULT */' + nl +
-                           '    (void)pool; (void)arg1; (void)arg2;' + nl +
-                           '    return r;' + nl)
+              run_body = ('    g_tp_run++;' + nl +
+                          '    g_sync_result = func ? func(arg1, arg2) : NULL;   /* SYNC_RESULT */' + nl)
+              wait_body = ('    g_tp_wait++;' + nl +
+                           '    {' + nl +
+                           '        void *r = g_sync_result;' + nl +
+                           '        g_sync_result = NULL;' + nl +
+                           '        if (r) g_tp_wait_nonnull++;' + nl +
+                           '        (void)pool; (void)arg1; (void)arg2;' + nl +
+                           '        return r;' + nl +
+                           '    }')
           else:
-              run_body = '    if (func) func(arg1, arg2);' + nl
-              wait_body = ('    (void)g_sync_result; (void)pool; (void)arg1; (void)arg2;' + nl +
+              run_body = '    g_tp_run++;' + nl + '    if (func) func(arg1, arg2);' + nl
+              wait_body = ('    g_tp_wait++;' + nl +
+                           '    (void)g_sync_result; (void)pool; (void)arg1; (void)arg2;' + nl +
                            '    return NULL;' + nl)
+          # Counters, readable from the FFmpeg wrapper through a weak symbol, because
+          # printf inside libdavs2.so never reaches logcat on Android.
+          tp_diag_src = (
+              'int davs2_tp_diag(int *init, int *run, int *wait, int *nonnull) {' + nl +
+              '    if (init) *init = g_tp_init;' + nl +
+              '    if (run) *run = g_tp_run;' + nl +
+              '    if (wait) *wait = g_tp_wait;' + nl +
+              '    if (nonnull) *nonnull = g_tp_wait_nonnull;' + nl +
+              '    return 0;' + nl +
+              '}' + nl)
 
           if os.path.exists(threadpool_cc):
               sync_impl = (
@@ -261,6 +278,7 @@ jobs:
                   '' + nl +
                   'struct davs2_threadpool_t { int dummy; };' + nl +
                   'static void *g_sync_result;   /* SYNC_RESULT: last job return value */' + nl +
+                  'static int g_tp_init, g_tp_run, g_tp_wait, g_tp_wait_nonnull;' + nl +
                   '' + nl +
                   'int davs2_threadpool_init(davs2_threadpool_t **p_pool, int threads,' + nl +
                   '                           davs2_threadpool_func_t init_func,' + nl +
@@ -268,6 +286,7 @@ jobs:
                   '    *p_pool = (davs2_threadpool_t *)calloc(1, sizeof(davs2_threadpool_t));' + nl +
                   '    if (!*p_pool) return -1;' + nl +
                   '    if (init_func) init_func(init_arg1, init_arg2);' + nl +
+                  '    g_tp_init++;' + nl +
                   '    return 0;' + nl +
                   '}' + nl +
                   '' + nl +
@@ -289,6 +308,7 @@ jobs:
                   '    if (pool) free(pool);' + nl +
                   '}' + nl
               )
+              sync_impl = sync_impl + tp_diag_src
               with open(threadpool_cc, 'w', encoding='latin-1') as f:
                   f.write(sync_impl)
               ok.append("threadpool.cc: REPLACED ENTIRE FILE with sync implementation")
@@ -628,18 +648,24 @@ jobs:
 
           # PATCH 6: one-shot frame logging. 8-bit AVS2 gives a picture, 10-bit AVS2 stays
           # black, and neither path logs anything, so this is what tells the two apart in a
-          # single build: is davs2 delivering frames at all, and with what geometry?
+          # single build: is davs2 delivering frames at all, and with what geometry? The
+          # threadpool counters come from the synchronous stub (weak reference, so an
+          # unpatched davs2 just reports -1) and say whether davs2 used the pool at all.
           # Temporary - remove it once the 10-bit case is understood.
           diag_anchor = '    int plane = 0;' + nl + '    int line  = 0;' + nl
           if 'DIAG_AVS2_FRAME' not in content and diag_anchor in content:
               diag_block = diag_anchor + nl + '''    /* DIAG_AVS2_FRAME: temporary instrumentation, remove after triage */
               {
+                  extern int davs2_tp_diag(int *, int *, int *, int *) __attribute__((weak));
                   static int diag_calls = 0;
                   if (diag_calls < 8) {
+                      int ti = -1, tr = -1, tw = -1, tn = -1;
                       diag_calls++;
+                      if (&davs2_tp_diag) davs2_tp_diag(&ti, &tr, &tw, &tn);
                       av_log(avctx, AV_LOG_WARNING,
                              "[avs2-diag] call=%d ret_type=%d hdr=%p out_bit_depth=%d bps=%d "
-                             "pic=%p type=%d p0=%dx%d/ls%d p1=%dx%d/ls%d p2=%dx%d/ls%d pixfmt=%d\\n",
+                             "pic=%p type=%d p0=%dx%d/ls%d p1=%dx%d/ls%d p2=%dx%d/ls%d pixfmt=%d "
+                             "tp_init=%d tp_run=%d tp_wait=%d tp_nonnull=%d\\n",
                              diag_calls, ret_type, (void *)headerset,
                              headerset ? headerset->output_bit_depth : -1, bytes_per_sample,
                              (void *)pic, pic ? pic->type : -1,
@@ -649,7 +675,7 @@ jobs:
                              pic ? pic->strides[1] : -1,
                              pic ? pic->widths[2] : -1, pic ? pic->lines[2] : -1,
                              pic ? pic->strides[2] : -1,
-                             avctx->pix_fmt);
+                             avctx->pix_fmt, ti, tr, tw, tn);
                   }
               }
           '''
@@ -711,6 +737,64 @@ jobs:
             touch "$FFMPEG_DIR/libavcodec/libdavs2.c"
             echo "Touched libdavs2.c to force recompilation"
           fi
+
+      - name: Patch FFmpeg libuavs3d.c wrapper (diagnostic)
+        run: |
+          cd mpv-android/buildscripts
+          FFMPEG_DIR=""
+          for c in deps/ffmpeg sources/ffmpeg; do
+            [ -d "$c/libavcodec" ] && FFMPEG_DIR="$c" && break
+          done
+          if [ -z "$FFMPEG_DIR" ]; then
+            FFMPEG_DIR=$(find . -type d -name "ffmpeg" | grep -v ".git" | head -1)
+          fi
+          LIBUAVS3D_C="$FFMPEG_DIR/libavcodec/libuavs3d.c"
+          [ -f "$LIBUAVS3D_C" ] || { echo "ERROR: libuavs3d.c not found"; exit 1; }
+
+          cat > /tmp/patch_uavs3d.py << 'SCRIPT_EOF'
+          import os
+          import sys
+
+          nl = chr(10)
+          path = os.environ.get('LIBUAVS3D_C', '')
+          if not path or not os.path.exists(path):
+              print('ERROR: libuavs3d.c missing (%r)' % path)
+              sys.exit(1)
+
+          src = open(path, encoding='latin-1').read()
+          if 'DIAG_AVS3_FRAME' in src:
+              print('libuavs3d.c: diagnostic already applied')
+              sys.exit(0)
+
+          anchor = '    *got_frame = h->dec_frame.got_pic;' + nl
+          if anchor not in src:
+              print('FAIL: got_pic anchor not found in libuavs3d.c (diagnostic skipped)')
+              sys.exit(0)
+
+          diag = anchor + '''
+              /* DIAG_AVS3_FRAME: temporary instrumentation, remove after triage */
+              {
+                  static int diag_calls = 0;
+                  if (diag_calls < 8) {
+                      diag_calls++;
+                      av_log(avctx, AV_LOG_WARNING,
+                             "[avs3-diag] call=%d got_pic=%d nal_type=%d bit_depth=%d "
+                             "w0=%d h0=%d frm=%dx%d fmt=%d buf=%d consumed=%d\\n",
+                             diag_calls, h->dec_frame.got_pic, h->dec_frame.nal_type,
+                             h->dec_frame.bit_depth,
+                             h->dec_frame.width[0], h->dec_frame.height[0],
+                             frm->width, frm->height, frm->format, buf_size,
+                             (int)(buf_ptr - buf));
+                  }
+              }
+          '''
+          open(path, 'w', encoding='latin-1').write(src.replace(anchor, diag, 1))
+          print('libuavs3d.c: added one-shot [avs3-diag] probe')
+
+          SCRIPT_EOF
+
+          LIBUAVS3D_C="$LIBUAVS3D_C" python3 /tmp/patch_uavs3d.py
+          touch "$LIBUAVS3D_C"
 
       - name: Apply CAVS patches to FFmpeg
         run: |
