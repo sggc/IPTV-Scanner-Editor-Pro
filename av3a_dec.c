@@ -212,6 +212,17 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
         return AVERROR_DECODER_NOT_FOUND;
     }
 
+    /* Disassembly of the shipped libavs3a_decoder.so (arm64):
+    **   Avs3AllocDecoder  =  mov w0,#0x100 ; b malloc   -> 256 *uninitialised* bytes
+    **   Avs3Decode        =  ldrh w8,[handle,#0x2a] ; cmp #4 ; br  (jump table on that u16)
+    **   Avs3InitDecoder   =  reads [handle+4] (float) and [handle+0xc] (int) before writing
+    ** Using the object before it holds a defined value is undefined behaviour and is what
+    ** took the process down at Avs3ParseBsFrameHeader+80. Zero it, and say whether the
+    ** initialiser that is supposed to fill those fields is even present. */
+    memset(s->decoder, 0, 256);
+    AV3A_LOGI("decoder object zeroed (256 bytes); Avs3InitDecoder %s\n",
+              dlsym(s->lib_handle, "Avs3InitDecoder") ? "present" : "absent");
+
     s->first_frame = 1;
     /* Use container-provided values if available, otherwise default to 48000 Hz stereo.
      * The actual values will be probed from the decoder struct after the first decode. */
@@ -237,6 +248,21 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     if (!avpkt->data || avpkt->size <= 0)
         return 0;
+
+    if (s->first_frame) {
+        char hex[24 * 3 + 1];
+        int n = avpkt->size < 24 ? avpkt->size : 24;
+        for (int i = 0; i < n; i++) {
+            sprintf(hex + 3 * i, "%02x ", avpkt->data[i]);
+        }
+        hex[3 * n] = '\0';
+        AV3A_LOGI("first packet size=%d head= %s\n", avpkt->size, hex);
+    }
+
+    if (!s->decoder) {
+        AV3A_LOGE("decoder object missing\n");
+        return AVERROR_BUG;
+    }
 
     /* Step 1: parse header */
     int header_consumed = 0;
