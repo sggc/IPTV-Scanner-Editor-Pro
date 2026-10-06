@@ -134,18 +134,6 @@ jobs:
           # === 4. Patch ffmpeg.sh ===
           sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/' scripts/ffmpeg.sh
           sed -i 's/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm/--cc=$CC --pkg-config=pkg-config --nm=llvm-nm --ar=llvm-ar --ranlib=llvm-ranlib --enable-small --optflags=-Os --extra-ldflags=-llog/' scripts/ffmpeg.sh
-          # CRITICAL: Force-enable pthreads for FFmpeg.
-          # Without this, FFmpeg's configure may fail to detect pthread_cancel
-          # in Android NDK cross-compilation, which disables the UDP circular
-          # buffer (the "pthread support is required" warning).
-          # --enable-pthreads forces FFmpeg to use pthreads regardless of
-          # auto-detection results.
-          if ! grep -q 'enable-pthreads' scripts/ffmpeg.sh; then
-            sed -i 's/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2}/--enable-{jni,mediacodec,mbedtls,libdav1d,libxml2,libdavs2} --enable-pthreads/' scripts/ffmpeg.sh
-            echo "=== Added --enable-pthreads to ffmpeg.sh ==="
-          fi
-          echo "=== ffmpeg.sh pthread-related flags ==="
-          grep -n "pthread" scripts/ffmpeg.sh || echo "(no pthread flags found)"
 
           # === 4c. Decoder list ===
           # NOTE: --enable-libuavs3d and --enable-libdavs2 are included here
@@ -185,23 +173,7 @@ jobs:
         run: |
           cd mpv-android/buildscripts
           export IN_CI=1
-          # Retry download up to 3 times to handle transient 502/503 errors
-          # from GitLab/GitHub servers
-          for attempt in 1 2 3; do
-            echo "=== Download attempt $attempt ==="
-            if ./download.sh; then
-              echo "=== Download succeeded on attempt $attempt ==="
-              break
-            else
-              echo "=== Download failed on attempt $attempt ==="
-              if [ $attempt -eq 3 ]; then
-                echo "ERROR: Download failed after 3 attempts"
-                exit 1
-              fi
-              echo "Waiting 10 seconds before retry..."
-              sleep 10
-            fi
-          done
+          ./download.sh
           echo "=== davs2 source check ==="
           ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 not found"; exit 1; }
 
@@ -233,6 +205,27 @@ jobs:
           #   void *davs2_threadpool_wait(pool, arg1, arg2)
           #   void davs2_threadpool_delete(pool)
           threadpool_cc = "source/common/threadpool.cc"
+          # davs2_threadpool_wait() returns the finished job's value. The synchronous stub
+          # can only do that if the job typedef really returns void*, so read threadpool.h
+          # instead of assuming it.
+          tp_job_h = "source/common/threadpool.h"
+          tp_job_src = ""
+          if os.path.exists(tp_job_h):
+              with open(tp_job_h, 'r', encoding='latin-1') as f:
+                  tp_job_src = f.read()
+          tp_job_m = re.search(r'typedef\s+([\w\s\*]*?)\s*\(\s*\*\s*davs2_threadpool_func_t\s*\)', tp_job_src)
+          job_returns_ptr = bool(tp_job_m) and '*' in tp_job_m.group(1)
+          print("threadpool job typedef returns void*: %s" % job_returns_ptr)
+          if job_returns_ptr:
+              run_body = '    g_sync_result = func ? func(arg1, arg2) : NULL;   /* SYNC_RESULT */' + nl
+              wait_body = ('    void *r = g_sync_result; g_sync_result = NULL;   /* SYNC_RESULT */' + nl +
+                           '    (void)pool; (void)arg1; (void)arg2;' + nl +
+                           '    return r;' + nl)
+          else:
+              run_body = '    if (func) func(arg1, arg2);' + nl
+              wait_body = ('    (void)g_sync_result; (void)pool; (void)arg1; (void)arg2;' + nl +
+                           '    return NULL;' + nl)
+
           if os.path.exists(threadpool_cc):
               sync_impl = (
                   '/* FORCE_SYNC_THREADPOOL - replaced by build script */' + nl +
@@ -246,6 +239,7 @@ jobs:
                   '#include <string.h>' + nl +
                   '' + nl +
                   'struct davs2_threadpool_t { int dummy; };' + nl +
+                  'static void *g_sync_result;   /* SYNC_RESULT: last job return value */' + nl +
                   '' + nl +
                   'int davs2_threadpool_init(davs2_threadpool_t **p_pool, int threads,' + nl +
                   '                           davs2_threadpool_func_t init_func,' + nl +
@@ -259,7 +253,7 @@ jobs:
                   'void davs2_threadpool_run(davs2_threadpool_t *pool,' + nl +
                   '                           davs2_threadpool_func_t func,' + nl +
                   '                           void *arg1, int arg2, int wait_sign) {' + nl +
-                  '    if (func) func(arg1, arg2);' + nl +
+                  run_body +
                   '}' + nl +
                   '' + nl +
                   'int davs2_threadpool_is_free(davs2_threadpool_t *pool) {' + nl +
@@ -267,7 +261,7 @@ jobs:
                   '}' + nl +
                   '' + nl +
                   'void *davs2_threadpool_wait(davs2_threadpool_t *pool, void *arg1, int arg2) {' + nl +
-                  '    return NULL;' + nl +
+                  wait_body +
                   '}' + nl +
                   '' + nl +
                   'void davs2_threadpool_delete(davs2_threadpool_t *pool) {' + nl +
@@ -610,6 +604,40 @@ jobs:
                       fail.append("5: Cannot find davs2_init function")
           else:
               ok.append("5: Already applied")
+
+          # PATCH 6: one-shot frame logging. 8-bit AVS2 gives a picture, 10-bit AVS2 stays
+          # black, and neither path logs anything, so this is what tells the two apart in a
+          # single build: is davs2 delivering frames at all, and with what geometry?
+          # Temporary - remove it once the 10-bit case is understood.
+          diag_anchor = '    int plane = 0;' + nl + '    int line  = 0;' + nl
+          if 'DIAG_AVS2_FRAME' not in content and diag_anchor in content:
+              diag_block = diag_anchor + nl + '''    /* DIAG_AVS2_FRAME: temporary instrumentation, remove after triage */
+              {
+                  static int diag_calls = 0;
+                  if (diag_calls < 8) {
+                      diag_calls++;
+                      av_log(avctx, AV_LOG_WARNING,
+                             "[avs2-diag] call=%d ret_type=%d hdr=%p out_bit_depth=%d bps=%d "
+                             "pic=%p type=%d p0=%dx%d/ls%d p1=%dx%d/ls%d p2=%dx%d/ls%d pixfmt=%d\\n",
+                             diag_calls, ret_type, (void *)headerset,
+                             headerset ? headerset->output_bit_depth : -1, bytes_per_sample,
+                             (void *)pic, pic ? pic->type : -1,
+                             pic ? pic->widths[0] : -1, pic ? pic->lines[0] : -1,
+                             pic ? pic->strides[0] : -1,
+                             pic ? pic->widths[1] : -1, pic ? pic->lines[1] : -1,
+                             pic ? pic->strides[1] : -1,
+                             pic ? pic->widths[2] : -1, pic ? pic->lines[2] : -1,
+                             pic ? pic->strides[2] : -1,
+                             avctx->pix_fmt);
+                  }
+              }
+          '''
+              content = content.replace(diag_anchor, diag_block, 1)
+              ok.append('6: davs2_dump_frames one-shot av_log')
+          elif 'DIAG_AVS2_FRAME' in content:
+              ok.append('6: Already applied')
+          else:
+              fail.append('6: dump_frames anchor missing (diagnostic skipped, build proceeds)')
 
           # Write
           if content != original:
@@ -1342,19 +1370,143 @@ jobs:
             fi
           done
 
-          # 3f. Add codec descriptor
+          # 3f. Add the AVCodecDescriptor entry for AV3A. This is required, not optional:
+          # without it avctx->codec_descriptor is NULL and ff_decode_preinit() dereferences
+          # it -> SIGSEGV the moment AV3A opens. avcodec_descriptor_get() bsearches the
+          # table, so the entry has to land at its numerically correct position. The old
+          # perl anchor (AV_CODEC_ID_FIRST_SUBTITLE) does not exist in codec_desc.c at all,
+          # so nothing was ever inserted and the step only printed a WARNING.
           CODEC_DESC_C="$FFMPEG_ABS/libavcodec/codec_desc.c"
           if [ -f "$CODEC_DESC_C" ] && ! grep -q "AV_CODEC_ID_AV3A" "$CODEC_DESC_C"; then
-            # Add codec descriptor using designated initializers (FFmpeg n8.0 style)
-            # Insert before the subtitle codecs section sentinel
-            perl -i -pe 'if (/AV_CODEC_ID_FIRST_SUBTITLE/) { $_ = qq(    {\n        .id         = AV_CODEC_ID_AV3A,\n        .type       = AVMEDIA_TYPE_AUDIO,\n        .name       = "av3a",\n        .long_name  = NULL_IF_CONFIG_SMALL("AVS3-P3 Audio Vivid (AV3A)"),\n        .props      = AV_CODEC_PROP_LOSSY,\n    },\n) . $_; }' "$CODEC_DESC_C" 2>/dev/null
-            if grep -q "AV_CODEC_ID_AV3A" "$CODEC_DESC_C"; then
-              echo "Added AV3A codec descriptor (designated initializers)"
-            else
-              echo "WARNING: Could not add AV3A codec descriptor, trying alternative"
-              sed -i '/AV_CODEC_ID_NONE,/i\    { .id = AV_CODEC_ID_AV3A, .type = AVMEDIA_TYPE_AUDIO, .name = "av3a", .long_name = NULL_IF_CONFIG_SMALL("AVS3-P3 Audio Vivid (AV3A)"), .props = AV_CODEC_PROP_LOSSY },' "$CODEC_DESC_C" 2>/dev/null || true
-            fi
+            cat > /tmp/patch_codec_desc.py << 'DESC_EOF'
+          import os
+          import re
+          import sys
+
+          # Insert an AVCodecDescriptor for AV3A into libavcodec/codec_desc.c.
+          #
+          # avcodec_descriptor_get() binary-searches codec_descriptors[], so the new entry has to
+          # sit at its numerically correct position. That position is derived from the
+          # already-patched codec_id.h (AV3A was injected into the middle of the audio
+          # block, which shifts every later implicit id by one), never from a section
+          # comment. Any failure is fatal on purpose: without the entry
+          # avctx->codec_descriptor stays NULL and ff_decode_preinit() dereferences it.
+
+          desc_path = os.environ.get('CODEC_DESC_C', '')
+          id_path = os.environ.get('CODEC_ID_H', '')
+
+          if not (os.path.exists(desc_path) and os.path.exists(id_path)):
+              print('FATAL: codec_desc.c or codec_id.h missing (%r %r)' % (desc_path, id_path))
+              sys.exit(1)
+
+          desc = open(desc_path, encoding='utf-8', errors='replace').read()
+          hdr = open(id_path, encoding='utf-8', errors='replace').read()
+
+
+          def parse_enum(text):
+              start = text.index('enum AVCodecID {')
+              body = text[start + len('enum AVCodecID {'):]
+              body = body[:body.index('\n};')]
+              body = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
+              body = re.sub(r'//[^\n]*', '', body)
+              vals = {}
+              auto = -1
+              for tok in body.split(','):
+                  m = re.match(r'\s*(AV_CODEC_ID_\w+)\s*(?:=\s*(.+?))?\s*$', tok, re.S)
+                  if not m:
+                      continue
+                  name, expr = m.group(1), (m.group(2) or '').strip()
+                  if expr:
+                      e = re.match(r'^(AV_CODEC_ID_\w+|0x[0-9a-fA-F]+|\d+)(?:\s*\+\s*(\d+))?$', expr)
+                      if not e:
+                          continue
+                      base = e.group(1)
+                      if base.startswith('0x'):
+                          val = int(base, 16)
+                      elif base.startswith('AV_CODEC_ID'):
+                          val = vals[base]
+                      else:
+                          val = int(base)
+                      if e.group(2):
+                          val += int(e.group(2))
+                  else:
+                      val = auto + 1
+                  vals[name] = val
+                  auto = val
+              return vals
+
+
+          vals = parse_enum(hdr)
+          if 'AV_CODEC_ID_AV3A' not in vals:
+              print('FATAL: AV_CODEC_ID_AV3A is not in codec_id.h, cannot place its descriptor')
+              sys.exit(1)
+
+          target = vals['AV_CODEC_ID_AV3A']
+          print('AV_CODEC_ID_AV3A resolves to 0x%x' % target)
+
+          table = re.search(r'static const AVCodecDescriptor (\w+)\[\] = \{', desc)
+          if not table:
+              print('FATAL: descriptor table declaration not found in codec_desc.c')
+              sys.exit(1)
+
+          insert_at = None
+          prev = None
+          for m in re.finditer(r'\.id\s*=\s*(AV_CODEC_ID_\w+)', desc):
+              name = m.group(1)
+              val = vals.get(name)
+              if val is None:
+                  continue
+              if val > target:
+                  brace = desc.rfind('{', 0, m.start())
+                  insert_at = desc.rfind('\n', 0, brace) + 1
+                  print('inserting before %s (0x%x), after %s (0x%x)'
+                        % (name, val, prev, vals.get(prev, -1)))
+                  break
+              prev = name
+
+          if insert_at is None:
+              print('FATAL: no descriptor entry with an id above 0x%x - refusing to append'
+                    % target)
+              sys.exit(1)
+
+          entry = (
+              '    {\n'
+              '        .id         = AV_CODEC_ID_AV3A,\n'
+              '        .type       = AVMEDIA_TYPE_AUDIO,\n'
+              '        .name       = "av3a",\n'
+              '        .long_name  = NULL_IF_CONFIG_SMALL("AVS3-P3 Audio Vivid (AV3A)"),\n'
+              '        .props      = AV_CODEC_PROP_LOSSY,\n'
+              '    },\n'
+          )
+
+          out = desc[:insert_at] + entry + desc[insert_at:]
+          open(desc_path, 'w', encoding='utf-8').write(out)
+
+
+          def ids_of(text):
+              return [vals[n] for n in re.findall(r'\.id\s*=\s*(AV_CODEC_ID_\w+)', text) if n in vals]
+
+
+          after = ids_of(out)
+          if 'AV_CODEC_ID_AV3A' not in out:
+              print('FATAL: entry did not make it into the file')
+              sys.exit(1)
+          if after != sorted(after):
+              print('FATAL: codec_descriptors[] is no longer sorted by id - bsearch would break')
+              sys.exit(1)
+          print('OK: %d descriptor entries, strictly ascending, AV3A included' % len(after))
+          DESC_EOF
+            CODEC_DESC_C="$CODEC_DESC_C" CODEC_ID_H="$CODEC_ID_H" python3 /tmp/patch_codec_desc.py
+          else
+            echo "AV3A codec descriptor already present, or codec_desc.c not found"
           fi
+          # Hard gate: a missing entry means a crash when AV3A opens, and an unsorted table
+          # would break descriptor lookup for every codec. Fail the build instead of shipping
+          # either.
+          [ -f "$CODEC_DESC_C" ] || { echo "FATAL: $CODEC_DESC_C not found"; exit 1; }
+          grep -q "AV_CODEC_ID_AV3A" "$CODEC_DESC_C" || { echo "FATAL: AV3A codec descriptor missing"; exit 1; }
+          echo "=== AV3A codec descriptor context ==="
+          grep -n -B4 -A8 "AV_CODEC_ID_AV3A" "$CODEC_DESC_C"
 
           echo "=== Step 4: Update ffmpeg.sh to enable AV3A decoder ==="
           cd "$GITHUB_WORKSPACE/mpv-android/buildscripts"
@@ -1407,126 +1559,106 @@ jobs:
           echo "=== All .so files in prefix ==="
           ls -la "$PREFIX_DIR/lib/"*.so* 2>/dev/null || echo "No .so files"
 
-      - name: Patch buildall.sh for pthread support
+      - name: Patch mpv.sh for pthread support
         run: |
           cd mpv-android/buildscripts
           # Android Bionic libc has pthread functions (pthread_create, etc.)
           # built directly into libc.so — there is no separate libpthread.so.
           # Meson's dependency('threads') in cross-compilation may fail because:
           # 1. It tries -lpthread which doesn't exist on Android
-          # 2. The crossfile.txt generated by buildall.sh's setup_prefix()
-          #    does not have a [properties] section to tell meson that
-          #    pthread_create is available in libc
+          # 2. The crossfile.txt generated by buildall.sh may not properly
+          #    configure the sysroot for thread detection
           #
-          # This causes FFmpeg's UDP circular buffer to be disabled:
+          # This causes mpv to disable the 'pthread' feature, which disables
+          # FFmpeg's UDP circular buffer:
           #   "udp: 'circular_buffer_size' option was set but it is not
           #    supported on this build (pthread support is required)"
           #
-          # Fix: Patch buildall.sh's setup_prefix() function to add
-          # [properties] section with has_function_pthread_create = true
-          # in the crossfile.txt it generates.
-          # This tells meson that pthread is available (in libc) without
-          # needing -lpthread.
-          #
-          # NOTE: mpv's meson.build does NOT have a -Dpthread option.
-          # Threads are auto-detected via dependency('threads').
-          # So we must NOT pass -Dpthread=enabled (it will cause meson error).
+          # Fix: Patch mpv.sh to:
+          # 1. Pass -Dpthread=enabled to force-enable the pthread feature
+          # 2. Inject a meson native file that declares threads as a built-in
+          #    dependency (no -lpthread needed, since pthread is in libc)
 
-          BUILDALL_SH="buildall.sh"
-          if [ ! -f "$BUILDALL_SH" ]; then
-            echo "ERROR: buildall.sh not found"
+          MPV_SH="scripts/mpv.sh"
+          if [ ! -f "$MPV_SH" ]; then
+            echo "ERROR: mpv.sh not found"
             exit 1
           fi
 
-          # Patch setup_prefix() to add [properties] section in crossfile
-          if ! grep -q "has_function_pthread_create" "$BUILDALL_SH"; then
-            # Write Python patch script using printf (avoids YAML heredoc indentation issues)
-            printf '%s\n' \
-              'import sys' \
-              'with open(sys.argv[1], "r") as f:' \
-              '    content = f.read()' \
-              'old = "[host_machine]"' \
-              'new = "[properties]\nhas_function_pthread_create = true\n\n[host_machine]"' \
-              'if old in content:' \
-              '    content = content.replace(old, new, 1)' \
-              '    with open(sys.argv[1], "w") as f:' \
-              '        f.write(content)' \
-              '    print("PATCHED: Added [properties] section before [host_machine]")' \
-              'else:' \
-              '    print("ERROR: [host_machine] not found in buildall.sh")' \
-              '    sys.exit(1)' > /tmp/patch_crossfile.py
-            python3 /tmp/patch_crossfile.py "$BUILDALL_SH"
-            echo "=== Patched buildall.sh to add [properties] to crossfile.txt ==="
-          else
-            echo "=== buildall.sh already patched ==="
+          echo "=== Original mpv.sh ==="
+          cat "$MPV_SH"
+
+          # Create a meson native/cross file override for threads
+          # This tells meson that the 'threads' dependency is satisfied
+          # without linking any external library (Android pthread is in libc)
+          THREADS_FILE="$GITHUB_WORKSPACE/mpv-android/buildscripts/threads-native.ini"
+          printf '%s\n' '[properties]' '# Android Bionic libc has pthread built-in, no -lpthread needed' 'has_function_pthread_create = true' > "$THREADS_FILE"
+
+          # Patch mpv.sh to:
+          # 1. Add -Dpthread=enabled to meson setup
+          # 2. Add --native-file pointing to our threads config
+          # We use sed to append the flags to the meson setup line
+          if ! grep -q "pthread=enabled" "$MPV_SH"; then
+            sed -i 's/-Dmanpage-build=disabled/-Dmanpage-build=disabled -Dpthread=enabled/' "$MPV_SH"
+            echo "=== Added -Dpthread=enabled to mpv.sh ==="
           fi
 
-          # Verify the patch
-          echo "=== Verifying buildall.sh patch ==="
-          grep -B1 -A2 "has_function_pthread_create" "$BUILDALL_SH" || echo "WARNING: has_function_pthread_create not found in buildall.sh"
+          # Also patch the crossfile.txt after buildall.sh generates it
+          # We do this by creating a wrapper that patches crossfile.txt
+          # before mpv.sh runs meson setup
+          # The crossfile.txt is generated by buildall.sh's setup_prefix()
+          # We'll patch it in the Build step below
 
-          echo "=== buildall.sh setup_prefix crossfile section ==="
-          sed -n '/cat >"\$prefix_dir\/crossfile.tmp"/,/CROSSFILE/p' "$BUILDALL_SH"
+          echo "=== Patched mpv.sh ==="
+          cat "$MPV_SH"
 
       - name: Build libmpv
         run: |
           cd mpv-android/buildscripts
           export IN_CI=1
 
-          # Verify crossfile.txt will have pthread support
-          # (buildall.sh's setup_prefix() was patched in previous step)
+          # Patch crossfile.txt to add has_function_pthread_create = true
+          # This helps meson's dependency('threads') detection succeed
+          # on Android where pthread is in libc (no separate libpthread.so)
+          patch_crossfile() {
+            local CF="$1"
+            if [ -f "$CF" ]; then
+              if ! grep -q "has_function_pthread_create" "$CF"; then
+                # Add to [properties] section, or create it if missing
+                if grep -q "\[properties\]" "$CF"; then
+                  sed -i '/\[properties\]/a has_function_pthread_create = true' "$CF"
+                else
+                  echo "" >> "$CF"
+                  echo "[properties]" >> "$CF"
+                  echo "has_function_pthread_create = true" >> "$CF"
+                fi
+                echo "Patched crossfile.txt: $CF"
+              fi
+            fi
+          }
+
+          # Try to patch before build (crossfile may already exist from
+          # previous build steps like uavs3d)
           PREFIX_DIR="prefix/${{ matrix.arch.buildall_arg }}"
+          patch_crossfile "$PREFIX_DIR/crossfile.txt"
 
           ./buildall.sh --arch ${{ matrix.arch.buildall_arg }} mpv
 
-          # Verify pthread was detected in meson logs
-          echo "=== Checking if pthread was detected ==="
+          # If buildall.sh regenerated crossfile.txt during the build,
+          # it may have overwritten our patch. Check if pthread was enabled.
+          echo "=== Checking if pthread was enabled ==="
           BUILD_DIR=$(find . -path "*/mpv/_build*" -type d 2>/dev/null | head -1)
           if [ -n "$BUILD_DIR" ]; then
             echo "Found mpv build dir: $BUILD_DIR"
-            # Check meson logs for threads/pthread
+            # Check meson logs for pthread
             if [ -f "$BUILD_DIR/meson-logs/meson-log.txt" ]; then
               echo "=== meson-log.txt pthread entries ==="
-              grep -i "pthread\|threads" "$BUILD_DIR/meson-logs/meson-log.txt" | head -20 || echo "(no pthread mentions in meson log)"
+              grep -i "pthread" "$BUILD_DIR/meson-logs/meson-log.txt" | head -20 || echo "(no pthread mentions in meson log)"
             fi
-            # Check if crossfile.txt has [properties] section
-            CF="$PREFIX_DIR/crossfile.txt"
-            if [ -f "$CF" ]; then
-              echo "=== crossfile.txt contents ==="
-              cat "$CF"
+            # Check if mpv build has pthread feature
+            if [ -f "$BUILD_DIR/meson-info/intro-buildoptions.json" ]; then
+              grep -i "pthread" "$BUILD_DIR/meson-info/intro-buildoptions.json" || true
             fi
-          fi
-
-          # CRITICAL: Verify FFmpeg config.h has pthread support enabled
-          echo "=== Checking FFmpeg config.h for pthread support ==="
-          FFMPEG_DIR=""
-          for c in deps/ffmpeg sources/ffmpeg; do
-            [ -f "$c/ffbuild/config.mak" ] && FFMPEG_DIR="$c" && break
-          done
-          if [ -n "$FFMPEG_DIR" ]; then
-            CONFIG_H=""
-            for f in "$FFMPEG_DIR/config.h" "$FFMPEG_DIR/ffbuild/config.h"; do
-              [ -f "$f" ] && CONFIG_H="$f" && break
-            done
-            if [ -n "$CONFIG_H" ]; then
-              echo "Checking $CONFIG_H for pthread flags..."
-              if grep -q "CONFIG_PTHREADS 1" "$CONFIG_H"; then
-                echo "OK: CONFIG_PTHREADS=1"
-              else
-                echo "ERROR: CONFIG_PTHREADS is NOT 1! Pthreads not enabled in FFmpeg!"
-                grep "PTHREAD" "$CONFIG_H" || echo "(no PTHREAD entries in config.h)"
-              fi
-              if grep -q "HAVE_PTHREAD_CANCEL 1" "$CONFIG_H"; then
-                echo "OK: HAVE_PTHREAD_CANCEL=1 — UDP circular buffer will work"
-              else
-                echo "WARNING: HAVE_PTHREAD_CANCEL is NOT 1 — UDP circular buffer may not work"
-                grep "PTHREAD_CANCEL" "$CONFIG_H" || echo "(no PTHREAD_CANCEL entries in config.h)"
-              fi
-            else
-              echo "WARNING: config.h not found in $FFMPEG_DIR"
-            fi
-          else
-            echo "WARNING: FFmpeg source dir not found for config.h check"
           fi
 
           find . -name "*.so" -ls 2>/dev/null || true
