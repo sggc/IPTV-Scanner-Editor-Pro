@@ -176,7 +176,25 @@ jobs:
         run: |
           cd mpv-android/buildscripts
           export IN_CI=1
-          ./download.sh
+          # Two layers of protection against intermittent GitHub release 500s:
+          #   1. per-fetch retries (download-sdk.sh / download-deps.sh honour $WGET)
+          #   2. re-run download.sh after dropping the empty deps/<name> dirs a
+          #      failed fetch leaves behind - those would otherwise be skipped by
+          #      the script's own "[ ! -d ]" guard on the next attempt.
+          export WGET="wget --tries=6 --timeout=30 --retry-connrefused"
+          dl_ok=0
+          for attempt in 1 2 3 4 5; do
+            find deps -maxdepth 1 -type d -empty -exec rmdir {} + 2>/dev/null || true
+            if ./download.sh; then
+              dl_ok=1
+              break
+            fi
+            echo "download.sh failed (attempt $attempt/5), retrying in 15s"
+            sleep 15
+          done
+          [ "$dl_ok" = "1" ] || { echo "ERROR: dependency download still failing after 5 attempts"; exit 1; }
+          dl_empty=$(find deps -maxdepth 1 -type d -empty -not -name deps 2>/dev/null || true)
+          [ -z "$dl_empty" ] || { echo "ERROR: dependencies left empty:"; echo "$dl_empty"; exit 1; }
           echo "=== davs2 source check ==="
           ls -la deps/davs2/build/linux/configure 2>/dev/null || { echo "ERROR: davs2 not found"; exit 1; }
 
@@ -1638,6 +1656,17 @@ jobs:
             fi
           fi
 
+          # buildall.sh can exit 0 without producing anything usable, and both steps after it
+          # used to "pass" when they found no output. Assert the libraries really exist.
+          for req in libmpv.so libavcodec.so libavformat.so libavutil.so libavfilter.so; do
+            if [ ! -f "$PREFIX_DIR/lib/$req" ]; then
+              echo "ERROR: buildall.sh finished but $PREFIX_DIR/lib/$req is missing"
+              ls -la "$PREFIX_DIR/lib" 2>/dev/null || echo "(no $PREFIX_DIR/lib at all)"
+              exit 1
+            fi
+          done
+          echo "=== build outputs in $PREFIX_DIR/lib ==="
+          ls -la "$PREFIX_DIR/lib"/*.so
           find . -name "*.so" -ls 2>/dev/null || true
 
       - name: Verify decoder support in built libavcodec.so
@@ -1650,9 +1679,12 @@ jobs:
               break
             fi
           done
-          [ -z "$PREFIX_LIB" ] && { echo "WARNING: No prefix lib dir found, skipping verification"; exit 0; }
+          if [ -z "$PREFIX_LIB" ]; then
+            echo "ERROR: no prefix lib dir found - the build produced nothing"
+            exit 1
+          fi
           AVCODEC_SO="$PREFIX_LIB/libavcodec.so"
-          [ -f "$AVCODEC_SO" ] || { echo "WARNING: libavcodec.so not found, skipping verification"; exit 0; }
+          [ -f "$AVCODEC_SO" ] || { echo "ERROR: $AVCODEC_SO missing - nothing was built"; exit 1; }
 
           # Find FFmpeg source dir for config.h verification
           FFMPEG_DIR=""
