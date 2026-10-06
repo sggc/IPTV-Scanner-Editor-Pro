@@ -84,13 +84,13 @@ jobs:
           cd mpv-android/buildscripts
 
           # === 1. depinfo.sh: add davs2 ===
-          sed -i '/^v_libxml2=/a v_davs2=1.7' include/depinfo.sh
+          sed -i '/^v_libxml2=/a v_davs2=1.6' include/depinfo.sh
           sed -i '/^dep_dav1d=/a dep_davs2=()' include/depinfo.sh
           sed -i 's/dep_ffmpeg=(mbedtls dav1d libxml2)/dep_ffmpeg=(mbedtls dav1d libxml2 davs2)/' include/depinfo.sh
 
           # === 2. download-deps.sh: add davs2 download ===
           # Clone WITHOUT --depth 1 so version.sh can use git rev-list
-          sed -i '/\[ ! -d dav1d \] && git clone/a [ ! -d davs2 ] && git clone --branch 1.7 https://github.com/pkuvcl/davs2.git' include/download-deps.sh
+          sed -i '/\[ ! -d dav1d \] && git clone/a [ ! -d davs2 ] && git clone --branch 1.6 https://github.com/pkuvcl/davs2.git' include/download-deps.sh
 
           # === 3. Create scripts/davs2.sh ===
           printf '%s\n' \
@@ -393,6 +393,52 @@ jobs:
                   'destroy_dpb(mgr);',
                   'if (mgr && mgr->dpb != NULL) destroy_dpb(mgr);'
               )
+
+              # 2d. DAVS2_DEC_PROBE: count the gates in decoder_decode_picture(). The API only
+              # hands back DAVS2_GOT_FRAME after a picture was dispatched, so if 'dispatched'
+              # stays 0 while 'seen' grows, the picture header parse is what is failing.
+              # Read back through davs2_dec_diag(), same weak-symbol channel that already
+              # delivered the threadpool counters.
+              if 'DAVS2_DEC_PROBE' not in content:
+                  head = ('/* DAVS2_DEC_PROBE: temporary instrumentation, remove after triage */' + nl +
+                          'extern "C" {' + nl +
+                          '    int davs2_dec_probe[4];' + nl +
+                          '    int davs2_dec_diag(int *seen, int *parse_ok, int *dispatched, int *dropped) {' + nl +
+                          '        if (seen) *seen = davs2_dec_probe[3];' + nl +
+                          '        if (parse_ok) *parse_ok = davs2_dec_probe[0];' + nl +
+                          '        if (dispatched) *dispatched = davs2_dec_probe[1];' + nl +
+                          '        if (dropped) *dropped = davs2_dec_probe[2];' + nl +
+                          '        return 0;' + nl +
+                          '    }' + nl +
+                          '}' + nl + nl)
+                  content = head + content
+                  a_parse = '    if (parse_header(h, &es_unit->bs) == 0) {'
+                  a_run = ('            davs2_threadpool_run((davs2_threadpool_t *)mgr->thread_pool, '
+                           'decoder_decode_picture_data, h, 0, 0);')
+                  a_drop = 'task_unload_packet(h, es_unit);'
+                  n_parse = content.count(a_parse)
+                  n_run = content.count(a_run)
+                  # both drop sites; newline-anchored, because the 8-space pattern is also a
+                  # substring of the 12-space line and a naive replace would corrupt it
+                  n_drop = 0
+                  for ind_drop in ('            ', '        '):
+                      pat = nl + ind_drop + a_drop
+                      c = content.count(pat)
+                      n_drop += c
+                      if c:
+                          content = content.replace(pat, nl + ind_drop + 'davs2_dec_probe[2]++;' + pat)
+                  if n_parse == 1 and n_run == 1 and n_drop >= 1:
+                      content = content.replace(a_parse,
+                                                '    davs2_dec_probe[3]++;' + nl + a_parse + nl +
+                                                '        davs2_dec_probe[0]++;', 1)
+                      content = content.replace(a_run, '            davs2_dec_probe[1]++;' + nl + a_run, 1)
+                      ok.append('davs2.cc: DEC_PROBE wired (parse x%d, dispatch x%d, drop x%d)'
+                                % (n_parse, n_run, n_drop))
+                  else:
+                      print('  DEC_PROBE anchors: parse=%d run=%d drop=%d - skipped'
+                            % (n_parse, n_run, n_drop))
+              else:
+                  ok.append('davs2.cc: DEC_PROBE already present')
 
               if content != orig:
                   with open(davs2_cc, 'w', encoding='latin-1') as f:
@@ -704,16 +750,22 @@ jobs:
               _cnt = _txt + nl + (
                   '    /* DIAG_AVS2_RET: temporary instrumentation, remove after triage */' + nl +
                   '    {' + nl +
+                  '        extern int davs2_dec_diag(int *, int *, int *, int *)' + nl +
+                  '            __attribute__((weak));' + nl +
                   '        static int ret_total = 0;' + nl +
                   '        static int ret_hist[8];' + nl +
                   '        int ri = (int)ret & 7;' + nl +
+                  '        int ds = -1, dp = -1, dd = -1, dk = -1;' + nl +
                   '        ret_total++;' + nl +
                   '        ret_hist[ri]++;' + nl +
                   '        if (ret_total <= 6 || (ret_total % 50) == 0) {' + nl +
+                  '            if (&davs2_dec_diag) davs2_dec_diag(&ds, &dp, &dd, &dk);' + nl +
                   '            av_log(avctx, AV_LOG_WARNING,' + nl +
-                  '                   "[avs2-ret] pkt=%d ret=%d hist[-1..6]=%d %d %d %d %d %d %d\\n",' + nl +
+                  '                   "[avs2-ret] pkt=%d ret=%d hist[0..6]=%d %d %d %d %d %d %d "' + nl +
+                  '                   "davs2[seen=%d parse_ok=%d dispatched=%d dropped=%d]\\n",' + nl +
                   '                   ret_total, (int)ret, ret_hist[0], ret_hist[1], ret_hist[2],' + nl +
-                  '                   ret_hist[3], ret_hist[4], ret_hist[5], ret_hist[6]);' + nl +
+                  '                   ret_hist[3], ret_hist[4], ret_hist[5], ret_hist[6],' + nl +
+                  '                   ds, dp, dd, dk);' + nl +
                   '        }' + nl +
                   '    }')
               content = content.replace(_txt, _cnt, 1)
