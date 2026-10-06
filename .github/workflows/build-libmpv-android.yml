@@ -49,7 +49,10 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        # v3 asks the SDK for the legacy "tools" package, which Google has
+        # removed from the repository ("Failed to find package 'tools'" -> exit 1).
+        # v4 no longer installs it.
+        uses: android-actions/setup-android@v4
 
       - name: Install Android NDK
         run: |
