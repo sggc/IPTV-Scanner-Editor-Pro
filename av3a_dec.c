@@ -52,6 +52,7 @@
 #endif
 
 /* AV3A decoder function pointer types */
+typedef int   (*av3a_init_fn)(void*, void**);
 typedef void* (*av3a_create_fn)(void);
 typedef void  (*av3a_destroy_fn)(void*);
 typedef int   (*av3a_parse_header_fn)(void*, const unsigned char*, int, int, int*, void*);
@@ -61,6 +62,8 @@ typedef struct AV3AContext {
     void *lib_handle;
     void *decoder;
     av3a_create_fn      fn_create;
+    av3a_init_fn         fn_init;
+    void                *model_handle;
     av3a_destroy_fn     fn_destroy;
     av3a_parse_header_fn fn_parse_header;
     av3a_decode_fn      fn_decode;
@@ -193,6 +196,7 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
      * We must dlsym the real names because the macro names don't exist
      * as exported symbols in the .so file. */
     s->fn_create      = (av3a_create_fn)      dlsym(s->lib_handle, "Avs3AllocDecoder");
+    s->fn_init        = (av3a_init_fn)        dlsym(s->lib_handle, "Avs3InitDecoder");
     s->fn_destroy     = (av3a_destroy_fn)     dlsym(s->lib_handle, "Avs3DecoderDestroy");
     s->fn_parse_header = (av3a_parse_header_fn) dlsym(s->lib_handle, "Avs3ParseBsFrameHeader");
     s->fn_decode      = (av3a_decode_fn)      dlsym(s->lib_handle, "Avs3Decode");
@@ -220,6 +224,36 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
     ** took the process down at Avs3ParseBsFrameHeader+80. Zero it, and say whether the
     ** initialiser that is supposed to fill those fields is even present. */
     memset(s->decoder, 0, 256);
+
+    /* More disassembly of Avs3InitDecoder(handle, x1):
+    **   ldr w8,[handle,#0xc] ; ldr s0,[handle,#4] ; fdiv  -> both are ints the CALLER
+    **   must write first (sample rate / frame length);
+    **   ldr x0,[x20] ; cbnz -> when *x20 == NULL it calls fopen("model.bin","rb")
+    **   (the two string literals sit right next to that call) and stores the result
+    **   back through x20, so argument 2 is a void** owning the model;
+    **   malloc(0x3010) is then kept at [handle,#0x50].
+    ** Avs3Decode separately dereferences a pointer at [handle,#0x68] that only this
+    ** path allocates - that is the wild-address fault we keep getting. */
+    {
+        unsigned char *hnd = (unsigned char *) s->decoder;
+        int flen = 1024;
+        int fs = avctx->sample_rate > 0 ? avctx->sample_rate : 48000;
+        memcpy(hnd + 4,  &flen, sizeof(int));
+        memcpy(hnd + 12, &fs,   sizeof(int));
+        s->model_handle = NULL;
+        if (s->fn_init) {
+            int irc;
+            AV3A_LOGI("calling Avs3InitDecoder(dec, &model) frame=%d fs=%d
+", flen, fs);
+            irc = s->fn_init(s->decoder, &s->model_handle);
+            AV3A_LOGI("Avs3InitDecoder returned %d model=%p
+", irc, s->model_handle);
+        } else {
+            AV3A_LOGW("Avs3InitDecoder absent - parse will fault
+");
+        }
+    }
+
     AV3A_LOGI("decoder object zeroed (256 bytes); Avs3InitDecoder %s\n",
               dlsym(s->lib_handle, "Avs3InitDecoder") ? "present" : "absent");
 
