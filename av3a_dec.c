@@ -226,34 +226,30 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
     memset(s->decoder, 0, 256);
 
     /* More disassembly of Avs3InitDecoder(handle, x1):
-    **   ldr w8,[handle,#0xc] ; ldr s0,[handle,#4] ; fdiv  -> both are ints the CALLER
-    **   must write first (sample rate / frame length);
-    **   ldr x0,[x20] ; cbnz -> when *x20 == NULL it calls fopen("model.bin","rb")
-    **   (the two string literals sit right next to that call) and stores the result
-    **   back through x20, so argument 2 is a void** owning the model;
-    **   malloc(0x3010) is then kept at [handle,#0x50].
-    ** Avs3Decode separately dereferences a pointer at [handle,#0x68] that only this
-    ** path allocates - that is the wild-address fault we keep getting. */
+**   ldr w8,[handle,#0xc] ; ldr s0,[handle,#4] ; fdiv  -> both are ints the CALLER
+**   must write first (sample rate / frame length);
+**   ldr x0,[x20] ; cbnz -> when *x20 is NULL the lib opens model.bin itself and
+**   stores the result back through x20, so argument 2 is a void** owning the
+**   model; malloc(0x3010) is then kept at [handle,#0x50]. Avs3Decode dereferences
+**   [handle,#0x68], which only this path allocates - skipping Init is what gave
+**   the wild-address faults. */
     {
         unsigned char *hnd = (unsigned char *) s->decoder;
         int flen = 1024;
         int fs = avctx->sample_rate > 0 ? avctx->sample_rate : 48000;
+        int irc;
+
         memcpy(hnd + 4,  &flen, sizeof(int));
         memcpy(hnd + 12, &fs,   sizeof(int));
         s->model_handle = NULL;
         if (s->fn_init) {
-            int irc;
-            AV3A_LOGI("calling Avs3InitDecoder(dec, &model) frame=%d fs=%d
-", flen, fs);
+            AV3A_LOGI("calling Avs3InitDecoder(dec, &model) frame=%d fs=%d\n", flen, fs);
             irc = s->fn_init(s->decoder, &s->model_handle);
-            AV3A_LOGI("Avs3InitDecoder returned %d model=%p
-", irc, s->model_handle);
+            AV3A_LOGI("Avs3InitDecoder returned %d model=%p\n", irc, s->model_handle);
         } else {
-            AV3A_LOGW("Avs3InitDecoder absent - parse will fault
-");
+            AV3A_LOGW("Avs3InitDecoder absent - parse would fault\n");
         }
     }
-
     AV3A_LOGI("decoder object zeroed (256 bytes); Avs3InitDecoder %s\n",
               dlsym(s->lib_handle, "Avs3InitDecoder") ? "present" : "absent");
 
