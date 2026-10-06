@@ -255,7 +255,13 @@ jobs:
                            '    return NULL;' + nl)
           # Counters, readable from the FFmpeg wrapper through a weak symbol, because
           # printf inside libdavs2.so never reaches logcat on Android.
+          # threadpool.cc is C++, so the export MUST be extern "C" - otherwise the symbol
+          # comes out mangled (_Z13davs2_tp_diagPiS_S_S_) and the wrapper's C declaration
+          # resolves to nothing, which is exactly why every tp_* field read -1 last round.
           tp_diag_src = (
+              '#if defined(__cplusplus)' + nl +
+              'extern "C"' + nl +
+              '#endif' + nl +
               'int davs2_tp_diag(int *init, int *run, int *wait, int *nonnull) {' + nl +
               '    if (init) *init = g_tp_init;' + nl +
               '    if (run) *run = g_tp_run;' + nl +
@@ -685,6 +691,37 @@ jobs:
               ok.append('6: Already applied')
           else:
               fail.append('6: dump_frames anchor missing (diagnostic skipped, build proceeds)')
+
+          # PATCH 8: count what davs2_decoder_recv_frame() answers per packet, including the
+          # DAVS2_DEFAULT ("nothing yet") returns that never reach davs2_dump_frames. That is
+          # the number we are missing: 10-bit delivered headers but zero frames, and the
+          # wrapper logs nothing for the "no frame" case. Printed numerically on purpose -
+          # no DAVS2_* constant names, so this cannot fail to compile.
+          import re as _re
+          _m = _re.search(r'ret\s*=\s*davs2_decoder_recv_frame\([^)]+\)\s*;', content)
+          if _m and 'DIAG_AVS2_RET' not in content:
+              _txt = _m.group(0)
+              _cnt = _txt + nl + (
+                  '    /* DIAG_AVS2_RET: temporary instrumentation, remove after triage */' + nl +
+                  '    {' + nl +
+                  '        static int ret_total = 0;' + nl +
+                  '        static int ret_hist[8];' + nl +
+                  '        int ri = (int)ret & 7;' + nl +
+                  '        ret_total++;' + nl +
+                  '        ret_hist[ri]++;' + nl +
+                  '        if (ret_total <= 6 || (ret_total % 50) == 0) {' + nl +
+                  '            av_log(avctx, AV_LOG_WARNING,' + nl +
+                  '                   "[avs2-ret] pkt=%d ret=%d hist[-1..6]=%d %d %d %d %d %d %d\\n",' + nl +
+                  '                   ret_total, (int)ret, ret_hist[0], ret_hist[1], ret_hist[2],' + nl +
+                  '                   ret_hist[3], ret_hist[4], ret_hist[5], ret_hist[6]);' + nl +
+                  '        }' + nl +
+                  '    }')
+              content = content.replace(_txt, _cnt, 1)
+              ok.append('8: recv_frame return counter')
+          elif 'DIAG_AVS2_RET' in content:
+              ok.append('8: Already applied')
+          else:
+              fail.append('8: recv_frame anchor missing (counter skipped, build proceeds)')
 
           # Write
           if content != original:
