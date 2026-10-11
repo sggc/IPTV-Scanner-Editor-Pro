@@ -112,53 +112,132 @@ typedef struct AV3AContext {
     int first_frame;
     int channels;
     int sample_rate;
+    int frame_length;   /* samples per frame as reported by the decoder     */
+    int pcm_bytes;      /* bytes of S16 PCM the decoder wrote for last frame */
 } AV3AContext;
 
 /*
- * Try to find numChansOutput and outputFs in the decoder struct.
- * The JNI code accesses decoder->numChansOutput and decoder->outputFs.
- * Without the header, we scan the first 256 ints for reasonable values.
+ * Mirror of the *prefix* of upstream AVS3Decoder (include/avs3_stat_dec.h,
+ * struct avs3_main_decoder_structure). FFmpeg's copy of av3a_dec.c lives in a
+ * separate directory and cannot include the codec's private header, so we
+ * restate the leading fields.
+ *
+ * CRITICAL: the field TYPES must be copied verbatim, and in the same order.
+ * Do NOT replace `long` with int32_t and pad by hand -- `long` is 8 bytes on
+ * arm64 (LP64) but 4 bytes on armeabi-v7a (ILP32), so a hand-padded mirror is
+ * only ever correct on one of the two ABIs and silently reads garbage on the
+ * other. By keeping the real types, the compiler derives the right offsets for
+ * whatever target it is building.
+ *
+ * Verified against the real header with _Static_assert() on BOTH ABIs
+ * (aarch64-linux-android21 and armv7a-linux-androideabi21) -- all pass.
+ * Resulting offsets:
+ *
+ *                       arm64   armv7a      (field type)
+ *     initFrame            0        0       short
+ *     outputFs             8        4       long   <- sample rate after parse
+ *     bitDepth            16        8       short  <- 16 or 24, NOT channels!
+ *     totalBitrate        24       12       long
+ *     lastTotalBrate      32       16       long
+ *     channelNumConfig    40       20       enum
+ *     numChansOutput      44       24       short  <- the REAL channel count
+ *     numObjsOutput       46       26       short
+ *     ...
+ *     frameLength         76       44       short  <- samples/frame (1024 @48k)
+ *     bitsPerFrame        80       48       int32
+ *
+ * WHY THIS EXISTS: the previous version guessed by scanning the struct for a
+ * plausible (sample_rate, channels) pair. At byte 8 it found outputFs = 48000
+ * (correct) and then, looking +-4 ints away, hit bitDepth = 16 at byte 16 and
+ * reported **16 channels**. The decoder really outputs 2 channels, so mpv was
+ * handed stereo S16 PCM declared as 16-channel interleaved -- every sample was
+ * mis-stride'd and the result was the piercing squeal you heard.
  */
-static void av3a_probe_decoder_info(AVCodecContext *avctx, AV3AContext *s)
+typedef struct Av3aDecoderPrefix {
+    short   initFrame;
+    long    outputFs;          /* 5.1.3.4 parsing output sampling rate */
+    short   bitDepth;          /* 16 / 24 -- do not confuse with channels  */
+    long    totalBitrate;
+    long    lastTotalBrate;
+    int     channelNumConfig;  /* enum ChannelNumConfig (int-sized)         */
+    short   numChansOutput;    /* the true output channel count             */
+    short   numObjsOutput;
+    long    bitratePerObj;
+    long    bitrateBedMc;
+    short   soundBedType;
+    short   isMixedContent;
+    short   hasLfe;
+    short   avs3CodecFormat;
+    short   avs3CodecCore;
+    short   bwidth;
+    short   frameLength;       /* samples per frame: 1024 @ 48 kHz          */
+    int32_t bitsPerFrame;
+} Av3aDecoderPrefix;
+
+/* Compile-time guarantee that the mirror above still lines up with reality.
+ * If upstream ever reorders these fields, the build breaks here rather than
+ * silently decoding to noise at runtime. Only enabled when the codec's own
+ * private header happens to be reachable (e.g. in a local/CI tree that has
+ * include/avs3_stat_dec.h on the include path). */
+#if defined(__has_include)
+#  if __has_include("avs3_stat_dec.h")
+#    include "avs3_stat_dec.h"
+_Static_assert(offsetof(AVS3Decoder, outputFs)         == offsetof(Av3aDecoderPrefix, outputFs),         "AV3A: outputFs offset drift");
+_Static_assert(offsetof(AVS3Decoder, bitDepth)         == offsetof(Av3aDecoderPrefix, bitDepth),         "AV3A: bitDepth offset drift");
+_Static_assert(offsetof(AVS3Decoder, channelNumConfig) == offsetof(Av3aDecoderPrefix, channelNumConfig), "AV3A: channelNumConfig offset drift");
+_Static_assert(offsetof(AVS3Decoder, numChansOutput)   == offsetof(Av3aDecoderPrefix, numChansOutput),   "AV3A: numChansOutput offset drift");
+_Static_assert(offsetof(AVS3Decoder, numObjsOutput)    == offsetof(Av3aDecoderPrefix, numObjsOutput),    "AV3A: numObjsOutput offset drift");
+_Static_assert(offsetof(AVS3Decoder, frameLength)      == offsetof(Av3aDecoderPrefix, frameLength),      "AV3A: frameLength offset drift");
+_Static_assert(offsetof(AVS3Decoder, bitsPerFrame)     == offsetof(Av3aDecoderPrefix, bitsPerFrame),     "AV3A: bitsPerFrame offset drift");
+#  endif
+#endif
+
+/*
+ * Read numChansOutput / outputFs / frameLength straight out of the decoder
+ * object. Returns 1 on success, 0 if the values look implausible (in which
+ * case the caller keeps its container-derived defaults).
+ */
+static int av3a_probe_decoder_info(AVCodecContext *avctx, AV3AContext *s)
 {
-    s->channels = 2;
-    s->sample_rate = 48000;
+    (void) avctx;
+    s->channels = s->channels > 0 ? s->channels : 2;
+    s->sample_rate = s->sample_rate > 0 ? s->sample_rate : 48000;
 
-    if (!s->decoder) return;
+    if (!s->decoder)
+        return 0;
 
-    /* Prefer the two fields the library actually maintains:
-     *     hAvs3Dec->numChansOutput   (channel count, set by parse_header)
-     *     hAvs3Dec->outputFs         (output sample rate, set by parse_header)
-     * We don't include the upstream header here, but both are plain `int`
-     * members reachable from the start of AVS3Decoder. Scan for a sane
-     * (sample_rate, channels) pair and cross-check it is stable.
-     *
-     * The scan is bounded to the first 256 int fields (1 KiB) -- AVS3Decoder
-     * is 320 bytes, so the useful fields are all inside that window. We only
-     * accept a pair where the sample rate is one of the 9 values in
-     * avs3SamplingRateTable and the channel count is a plausible 1..64. */
-    const int *ints = (const int *)s->decoder;
-    for (int i = 0; i < 256; i++) {
-        int val = ints[i];
-        /* Check for common sample rates */
-        if (val == 48000 || val == 44100 || val == 24000 ||
-            val == 16000 || val == 8000  || val == 96000 ||
-            val == 192000 || val == 32000 || val == 22050) {
-            /* Look nearby for a valid channel count */
-            for (int j = i - 4; j <= i + 4; j++) {
-                if (j < 0 || j >= 256 || j == i) continue;
-                int ch = ints[j];
-                if (ch >= 1 && ch <= 64) {
-                    s->sample_rate = val;
-                    s->channels = ch;
-                    AV3A_LOGI("probed sample_rate=%d channels=%d (offsets %d,%d)\n",
-                           val, ch, i, j);
-                    return;
-                }
-            }
-        }
+    const Av3aDecoderPrefix *p = (const Av3aDecoderPrefix *) s->decoder;
+
+    /* Sanity-check against the values the library is allowed to produce:
+     *   outputFs     -- one of the entries in avs3SamplingRateTable
+     *   numChans     -- 1..MAX_CHANNELS (16) */
+    static const long valid_fs[] = { 192000, 96000, 48000, 44100, 32000,
+                                     24000, 22050, 16000, 8000 };
+    int fs_ok = 0;
+    for (size_t i = 0; i < sizeof(valid_fs)/sizeof(valid_fs[0]); i++) {
+        if (p->outputFs == valid_fs[i]) { fs_ok = 1; break; }
     }
-    AV3A_LOGW("could not probe decoder info, using defaults (48000 Hz, 2ch)\n");
+
+    if (!fs_ok || p->numChansOutput < 1 || p->numChansOutput > 16) {
+        AV3A_LOGW("decoder struct looks unpopulated "
+                  "(outputFs=%ld bitDepth=%d numChansOutput=%d) - "
+                  "keeping defaults %d Hz %d ch\n",
+                  p->outputFs, (int) p->bitDepth, (int) p->numChansOutput,
+                  s->sample_rate, s->channels);
+        return 0;
+    }
+
+    s->sample_rate = (int) p->outputFs;
+    s->channels    = (int) p->numChansOutput;
+    /* frameLength is a short written by parse_header(); guard against a zero
+     * or implausible value so the caller's frame-size arithmetic stays sane. */
+    s->frame_length = (p->frameLength > 0 && p->frameLength <= 8192)
+                      ? (int) p->frameLength : 1024;
+    AV3A_LOGI("decoder info: sample_rate=%d channels=%d bitDepth=%d "
+              "frameLength=%d\n",
+              s->sample_rate, s->channels, (int) p->bitDepth,
+              s->frame_length);
+    return 1;
 }
 
 /*
@@ -273,22 +352,22 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
         return AVERROR_DECODER_NOT_FOUND;
     }
 
-    /* No manual memset(256) and no manual field poking:
-     *   - avs3_create_decoder() uses calloc(1, sizeof(AVS3Decoder)), so the
-     *     object is already fully zeroed and correctly sized (320 bytes here,
-     *     not the 256 the old internal Avs3AllocDecoder returned).
+    /* No manual memset and no manual field poking:
+     *   - avs3_create_decoder() calloc()s the object, so it is already fully
+     *     zeroed and correctly sized for the .so we bound to. Pre-writing
+     *     fields by guessed offset is what used to fault.
      *   - avs3_decode() lazily calls Avs3InitDecoder(hAvs3Dec, &fModel,
-     *     "model.bin") itself on the first packet, so we must NOT pre-write
-     *     frameLength / sample rate or call Avs3InitDecoder by hand. Doing so
-     *     on a struct whose layout we guessed is what used to fault.
+     *     "model.bin") itself on the first packet, so we must NOT call it by
+     *     hand or pre-set frameLength / sample rate.
      * av3a_ensure_model_bin() (called earlier in this function) still chdir()s
      * to a directory containing model.bin, which the lazy init relies on. */
 
     s->first_frame = 1;
-    /* Use container-provided values if available, otherwise default to 48000 Hz stereo.
-     * The actual values will be probed from the decoder struct after the first decode. */
-    s->sample_rate = avctx->sample_rate > 0 ? avctx->sample_rate : 48000;
-    s->channels = avctx->ch_layout.nb_channels > 0 ? avctx->ch_layout.nb_channels : 2;
+    /* Start from whatever the container told us; av3a_probe_decoder_info()
+     * overwrites these from the decoder object once parse_header() has run. */
+    s->sample_rate  = avctx->sample_rate > 0 ? avctx->sample_rate : 48000;
+    s->channels     = avctx->ch_layout.nb_channels > 0 ? avctx->ch_layout.nb_channels : 2;
+    s->frame_length = 1024; /* FRAME_LEN at 48 kHz; corrected by the probe */
 
     avctx->sample_fmt = AV_SAMPLE_FMT_S16;
     avctx->sample_rate = s->sample_rate;
@@ -303,7 +382,15 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                               int *got_frame_ptr, AVPacket *avpkt)
 {
     AV3AContext *s = avctx->priv_data;
-    uint8_t temp_output[65536]; /* 64 KB stack buffer (matches JNI minimum) */
+    /* Worst case the AVS3 core can emit in one avs3_decode() call:
+     *   MAX_CHANNELS(16) * max frame length * 2 bytes/sample
+     * At 192 kHz frameLength is FRAME_LEN * (192/48) = 4096, so the ceiling is
+     * 16 * 4096 * 2 = 131072 bytes. Earlier this was 65536 -- exactly the size
+     * of a 96 kHz / 16-channel frame, i.e. zero headroom -- which meant a
+     * 192 kHz stream overran the buffer before the size check could run.
+     * Any excess is additionally clamped below, but the buffer itself must be
+     * large enough first. */
+    uint8_t temp_output[16 * 4096 * 2]; /* 128 KB */
 
     *got_frame_ptr = 0;
 
@@ -347,7 +434,23 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         return avpkt->size;
     }
 
-    /* Step 2: decode the payload.
+    /* Step 2: probe the decoder struct NOW, before decoding.
+     * parse_header() above has already written outputFs / numChansOutput /
+     * frameLength into the decoder object, so the values we need are available
+     * without waiting for a decoded frame. Doing this here (rather than after
+     * the first decode) means av_channel_layout_default() and ff_get_buffer()
+     * below already use the real channel count on the very first frame --
+     * no more "first frame is garbage, later frames are fine" gap. */
+    if (s->first_frame) {
+        av3a_probe_decoder_info(avctx, s);
+        avctx->sample_rate = s->sample_rate;
+        av_channel_layout_uninit(&avctx->ch_layout);
+        av_channel_layout_default(&avctx->ch_layout, s->channels);
+        AV3A_LOGI("format set to %d Hz, %d ch\n",
+               s->sample_rate, s->channels);
+    }
+
+    /* Step 3: decode the payload.
      * avs3_decode(dec, in, nLenIn, out, &pnLenOut, &pnLenConsumed)
      * takes the byte range *after* the header, copies the frame into the
      * decoder's internal bitstream, runs the core decoder and writes
@@ -362,24 +465,35 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                  temp_output, &output_bytes, &payload_consumed);
 
     if (output_bytes <= 0) {
-        AV3A_LOGW("decode: result=%d output=%d payload_consumed=%d\n",
-               decode_result, output_bytes, payload_consumed);
+        if (s->first_frame) {
+            AV3A_LOGW("decode: result=%d output=%d payload_consumed=%d\n",
+                   decode_result, output_bytes, payload_consumed);
+        }
         return avpkt->size;
     }
 
-    /* Step 3: probe decoder info after first successful decode */
-    if (s->first_frame) {
-        av3a_probe_decoder_info(avctx, s);
-        avctx->sample_rate = s->sample_rate;
-        av_channel_layout_uninit(&avctx->ch_layout);
-        av_channel_layout_default(&avctx->ch_layout, s->channels);
-        s->first_frame = 0;
-        AV3A_LOGI("format set to %d Hz, %d ch\n",
-               s->sample_rate, s->channels);
+    /* Step 4: hand the PCM to FFmpeg.
+     *
+     * output_bytes is numChansOutput * frameLength * 2 * nFrames of interleaved
+     * S16. We must NOT let it exceed the stack buffer, and nb_samples must be
+     * the true per-channel sample count, otherwise every subsequent sample is
+     * read at the wrong stride and the audio becomes a squeal. */
+    int bytes_per_sample = 2; /* S16 */
+    int max_bytes = (int) sizeof(temp_output);
+    if (output_bytes > max_bytes) {
+        AV3A_LOGW("decoder produced %d bytes > %d byte buffer - truncating to "
+                  "whole frames\n", output_bytes, max_bytes);
+        int frame_bytes = s->channels * bytes_per_sample *
+                          (s->frame_length > 0 ? s->frame_length : 1024);
+        if (frame_bytes > 0)
+            output_bytes = (max_bytes / frame_bytes) * frame_bytes;
+        if (output_bytes <= 0) {
+            AV3A_LOGW("cannot fit a single frame (%d bytes) - dropping\n",
+                      frame_bytes);
+            return avpkt->size;
+        }
     }
 
-    /* Step 4: allocate FFmpeg frame and copy decoded data */
-    int bytes_per_sample = 2; /* S16 */
     int nb_samples = output_bytes / (s->channels * bytes_per_sample);
     if (nb_samples <= 0) {
         AV3A_LOGW("invalid nb_samples=%d (output=%d ch=%d)\n",
@@ -389,6 +503,7 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     frame->nb_samples = nb_samples;
     frame->format = AV_SAMPLE_FMT_S16;
+    frame->sample_rate = s->sample_rate;
     int ret = ff_get_buffer(avctx, frame, 0);
     if (ret < 0) {
         AV3A_LOGE("ff_get_buffer failed: %d\n", ret);
@@ -398,8 +513,12 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     memcpy(frame->data[0], temp_output, output_bytes);
 
     *got_frame_ptr = 1;
-    AV3A_LOGI("decoded %d bytes → %d samples (%d ch, %d Hz)\n",
-           output_bytes, nb_samples, s->channels, s->sample_rate);
+    if (s->first_frame) {
+        AV3A_LOGI("decoded %d bytes → %d samples (%d ch, %d Hz, %d bytes/sample)\n",
+               output_bytes, nb_samples, s->channels, s->sample_rate,
+               bytes_per_sample);
+        s->first_frame = 0;
+    }
 
     return avpkt->size;
 }
