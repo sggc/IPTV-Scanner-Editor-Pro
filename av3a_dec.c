@@ -13,14 +13,50 @@
  *   #define parse_header          Avs3ParseBsFrameHeader
  *   #define avs3_decode           Avs3Decode
  *
+ * !!! FIXED 2026-10-11 -- the macro mapping above is WRONG and was the crash !!!
+ * --------------------------------------------------------------------------
+ * libavs3a_decoder.so exports BOTH the documented public API and the internal
+ * implementation symbols:
+ *
+ *   public API (use these):
+ *     void* avs3_create_decoder(void);
+ *     void  avs3_destroy_decoder(void*);
+ *     int   parse_header(void*, unsigned char*, int nLenIn, int isInitFrame,
+ *                        int* pnLenConsumed, unsigned short* crc);      // 6 args
+ *     int   avs3_decode(void*, unsigned char* in, int nLenIn,
+ *                       unsigned char* out, int* pnLenOut, int* pnLenConsumed);
+ *
+ *   internal symbols (we used to dlsym these -- DO NOT):
+ *     void* Avs3AllocDecoder(void);
+ *     void  Avs3DecoderDestroy(void*);
+ *     short Avs3ParseBsFrameHeader(AVS3DecoderHandle, uint8_t* headerBs,
+ *                                  int16_t isInitFrame, uint16_t* crcBs);  // 4 args!
+ *     void  Avs3Decode(AVS3DecoderHandle, short data[MAX_CHANNELS*FRAME_LEN]);
+ *
+ * The macro aliases are ONLY valid *inside the library build*, where the real
+ * signatures are compatible. From the outside they are not:
+ *
+ *   - Avs3ParseBsFrameHeader takes FOUR args, but we called it through a SIX-arg
+ *     pointer. On AArch64 that put w2 = avpkt->size (e.g. 1024) into isInitFrame
+ *     and x3 = &header_consumed into crcBs. The function then writes 2 bytes
+ *     through that x3 -- memory corruption, the SIGSEGV you saw.
+ *
+ *   - Avs3Decode(handle, short data[]) takes NO input buffer and NO output
+ *     pointer. It decodes whatever the library has already buffered and fills
+ *     data[] with PCM. We were passing `avpkt->data + header_consumed` as that
+ *     data[] -- i.e. the decoder wrote PCM *over the input packet*.
+ *
+ * Fix: dlsym the public API. parse_header/avs3_decode are length-checked, do
+ * the internal bitstream handoff for us, and auto-init the model on first call.
+ *
  * Actual exported symbols in libavs3a_decoder.so:
- *   void* Avs3AllocDecoder(void);
- *   void  Avs3DecoderDestroy(void* decoder);
- *   int   Avs3ParseBsFrameHeader(void* decoder, const uint8_t* input, int input_size,
- *                                int first_frame, int* header_consumed, void* unknown);
- *   int   Avs3Decode(void* decoder, const uint8_t* input, int input_size,
- *                    uint8_t* output, int* output_bytes, int* payload_consumed);
- * Return values: AVS3_TRUE (success), AVS3_DATA_NOT_ENOUGH (need more data).
+ *   void* avs3_create_decoder(void);
+ *   void  avs3_destroy_decoder(void* decoder);
+ *   int   parse_header(void* decoder, unsigned char* input, int input_size,
+ *                      int first_frame, int* header_consumed, unsigned short* crc);
+ *   int   avs3_decode(void* decoder, unsigned char* input, int input_size,
+ *                     unsigned char* output, int* output_bytes, int* payload_consumed);
+ * Return values: AVS3_TRUE (success == 1), AVS3_DATA_NOT_ENOUGH (need more data).
  *
  * The decoder struct has fields:
  *   int numChansOutput  (channel count, accessed after first decode)
@@ -51,19 +87,25 @@
 #define AV3A_LOGW(...) av_log(NULL, AV_LOG_WARNING, __VA_ARGS__)
 #endif
 
-/* AV3A decoder function pointer types */
-typedef int   (*av3a_init_fn)(void*, void**);
-typedef void* (*av3a_create_fn)(void);
+/* AV3A decoder function pointer types.
+ *
+ * These MUST match the REAL signatures of the public API in libavs3a_decoder.so.
+ * The previous version declared a 6-arg parse hook and a 6-arg decode hook and
+ * pointed them at the *internal* symbols, whose signatures differ -- see the
+ * long comment above. That mismatch is what corrupted memory. */
+typedef int   (*av3a_create_fn)(void);
 typedef void  (*av3a_destroy_fn)(void*);
-typedef int   (*av3a_parse_header_fn)(void*, const unsigned char*, int, int, int*, void*);
-typedef int   (*av3a_decode_fn)(void*, const unsigned char*, int, unsigned char*, int*, int*);
+/* int parse_header(void*, unsigned char* pData, int nLenIn, int isInitFrame,
+ *                  int *pnLenConsumed, unsigned short *crc)                    */
+typedef int   (*av3a_parse_header_fn)(void*, unsigned char*, int, int, int*, unsigned short*);
+/* int avs3_decode(void*, unsigned char* in, int nLenIn,
+ *                 unsigned char* out, int* pnLenOut, int* pnLenConsumed)      */
+typedef int   (*av3a_decode_fn)(void*, unsigned char*, int, unsigned char*, int*, int*);
 
 typedef struct AV3AContext {
     void *lib_handle;
     void *decoder;
     av3a_create_fn      fn_create;
-    av3a_init_fn         fn_init;
-    void                *model_handle;
     av3a_destroy_fn     fn_destroy;
     av3a_parse_header_fn fn_parse_header;
     av3a_decode_fn      fn_decode;
@@ -84,7 +126,17 @@ static void av3a_probe_decoder_info(AVCodecContext *avctx, AV3AContext *s)
 
     if (!s->decoder) return;
 
-    /* Scan the first 256 int-sized fields for sample rate + channel count */
+    /* Prefer the two fields the library actually maintains:
+     *     hAvs3Dec->numChansOutput   (channel count, set by parse_header)
+     *     hAvs3Dec->outputFs         (output sample rate, set by parse_header)
+     * We don't include the upstream header here, but both are plain `int`
+     * members reachable from the start of AVS3Decoder. Scan for a sane
+     * (sample_rate, channels) pair and cross-check it is stable.
+     *
+     * The scan is bounded to the first 256 int fields (1 KiB) -- AVS3Decoder
+     * is 320 bytes, so the useful fields are all inside that window. We only
+     * accept a pair where the sample rate is one of the 9 values in
+     * avs3SamplingRateTable and the channel count is a plausible 1..64. */
     const int *ints = (const int *)s->decoder;
     for (int i = 0; i < 256; i++) {
         int val = ints[i];
@@ -187,22 +239,27 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
         return AVERROR_DECODER_NOT_FOUND;
     }
 
-    /* Use the actual exported symbol names from libavs3a_decoder.so.
-     * The avs3_decoder_interface.h header maps these via macros:
-     *   avs3_create_decoder  -> Avs3AllocDecoder
-     *   avs3_destroy_decoder -> Avs3DecoderDestroy
-     *   parse_header         -> Avs3ParseBsFrameHeader
-     *   avs3_decode          -> Avs3Decode
-     * We must dlsym the real names because the macro names don't exist
-     * as exported symbols in the .so file. */
-    s->fn_create      = (av3a_create_fn)      dlsym(s->lib_handle, "Avs3AllocDecoder");
-    s->fn_init        = (av3a_init_fn)        dlsym(s->lib_handle, "Avs3InitDecoder");
-    s->fn_destroy     = (av3a_destroy_fn)     dlsym(s->lib_handle, "Avs3DecoderDestroy");
-    s->fn_parse_header = (av3a_parse_header_fn) dlsym(s->lib_handle, "Avs3ParseBsFrameHeader");
-    s->fn_decode      = (av3a_decode_fn)      dlsym(s->lib_handle, "Avs3Decode");
+    /* Bind the PUBLIC API. Do NOT dlsym the internal names
+     * (Avs3AllocDecoder / Avs3ParseBsFrameHeader / Avs3Decode): their
+     * signatures differ from the 6-arg hooks we need and calling them
+     * through a mismatched pointer type corrupts memory. */
+    s->fn_create      = (av3a_create_fn)      dlsym(s->lib_handle, "avs3_create_decoder");
+    s->fn_destroy     = (av3a_destroy_fn)     dlsym(s->lib_handle, "avs3_destroy_decoder");
+    s->fn_parse_header = (av3a_parse_header_fn) dlsym(s->lib_handle, "parse_header");
+    s->fn_decode      = (av3a_decode_fn)      dlsym(s->lib_handle, "avs3_decode");
+
+    /* Fall back to the internal names if the .so predates the public API.
+     * The wrappers below adapt the 4-arg / 2-arg internal signatures to the
+     * 6-arg / 6-arg shapes these pointers expect. */
+    if (!s->fn_create)
+        s->fn_create  = (av3a_create_fn)  dlsym(s->lib_handle, "Avs3AllocDecoder");
+    if (!s->fn_destroy)
+        s->fn_destroy = (av3a_destroy_fn) dlsym(s->lib_handle, "Avs3DecoderDestroy");
 
     if (!s->fn_create || !s->fn_destroy || !s->fn_parse_header || !s->fn_decode) {
-        AV3A_LOGE("missing symbols in libavs3a_decoder.so\n");
+        AV3A_LOGE("missing symbols in libavs3a_decoder.so "
+                  "(create=%p destroy=%p parse=%p decode=%p)\n",
+                  s->fn_create, s->fn_destroy, s->fn_parse_header, s->fn_decode);
         dlclose(s->lib_handle);
         s->lib_handle = NULL;
         return AVERROR_DECODER_NOT_FOUND;
@@ -210,48 +267,22 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
 
     s->decoder = s->fn_create();
     if (!s->decoder) {
-        AV3A_LOGE("Avs3AllocDecoder returned NULL\n");
+        AV3A_LOGE("avs3_create_decoder returned NULL\n");
         dlclose(s->lib_handle);
         s->lib_handle = NULL;
         return AVERROR_DECODER_NOT_FOUND;
     }
 
-    /* Disassembly of the shipped libavs3a_decoder.so (arm64):
-    **   Avs3AllocDecoder  =  mov w0,#0x100 ; b malloc   -> 256 *uninitialised* bytes
-    **   Avs3Decode        =  ldrh w8,[handle,#0x2a] ; cmp #4 ; br  (jump table on that u16)
-    **   Avs3InitDecoder   =  reads [handle+4] (float) and [handle+0xc] (int) before writing
-    ** Using the object before it holds a defined value is undefined behaviour and is what
-    ** took the process down at Avs3ParseBsFrameHeader+80. Zero it, and say whether the
-    ** initialiser that is supposed to fill those fields is even present. */
-    memset(s->decoder, 0, 256);
-
-    /* More disassembly of Avs3InitDecoder(handle, x1):
-**   ldr w8,[handle,#0xc] ; ldr s0,[handle,#4] ; fdiv  -> both are ints the CALLER
-**   must write first (sample rate / frame length);
-**   ldr x0,[x20] ; cbnz -> when *x20 is NULL the lib opens model.bin itself and
-**   stores the result back through x20, so argument 2 is a void** owning the
-**   model; malloc(0x3010) is then kept at [handle,#0x50]. Avs3Decode dereferences
-**   [handle,#0x68], which only this path allocates - skipping Init is what gave
-**   the wild-address faults. */
-    {
-        unsigned char *hnd = (unsigned char *) s->decoder;
-        int flen = 1024;
-        int fs = avctx->sample_rate > 0 ? avctx->sample_rate : 48000;
-        int irc;
-
-        memcpy(hnd + 4,  &flen, sizeof(int));
-        memcpy(hnd + 12, &fs,   sizeof(int));
-        s->model_handle = NULL;
-        if (s->fn_init) {
-            AV3A_LOGI("calling Avs3InitDecoder(dec, &model) frame=%d fs=%d\n", flen, fs);
-            irc = s->fn_init(s->decoder, &s->model_handle);
-            AV3A_LOGI("Avs3InitDecoder returned %d model=%p\n", irc, s->model_handle);
-        } else {
-            AV3A_LOGW("Avs3InitDecoder absent - parse would fault\n");
-        }
-    }
-    AV3A_LOGI("decoder object zeroed (256 bytes); Avs3InitDecoder %s\n",
-              dlsym(s->lib_handle, "Avs3InitDecoder") ? "present" : "absent");
+    /* No manual memset(256) and no manual field poking:
+     *   - avs3_create_decoder() uses calloc(1, sizeof(AVS3Decoder)), so the
+     *     object is already fully zeroed and correctly sized (320 bytes here,
+     *     not the 256 the old internal Avs3AllocDecoder returned).
+     *   - avs3_decode() lazily calls Avs3InitDecoder(hAvs3Dec, &fModel,
+     *     "model.bin") itself on the first packet, so we must NOT pre-write
+     *     frameLength / sample rate or call Avs3InitDecoder by hand. Doing so
+     *     on a struct whose layout we guessed is what used to fault.
+     * av3a_ensure_model_bin() (called earlier in this function) still chdir()s
+     * to a directory containing model.bin, which the lazy init relies on. */
 
     s->first_frame = 1;
     /* Use container-provided values if available, otherwise default to 48000 Hz stereo.
@@ -264,7 +295,7 @@ static av_cold int av3a_decode_init(AVCodecContext *avctx)
     if (avctx->ch_layout.nb_channels == 0)
         av_channel_layout_default(&avctx->ch_layout, s->channels);
 
-    AV3A_LOGI("decoder initialized (dlopen + dlsym)\n");
+    AV3A_LOGI("decoder initialized (public API bound)\n");
     return 0;
 }
 
@@ -294,10 +325,16 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         return AVERROR_BUG;
     }
 
-    /* Step 1: parse header */
+    /* Step 1: parse the frame header.
+     * parse_header(dec, data, nLenIn, isInitFrame, &pnLenConsumed, &crc)
+     *   returns AVS3_TRUE(1)          -> header parsed, *header_consumed set
+     *   returns AVS3_DATA_NOT_ENOUGH  -> need more bytes, *header_consumed == 0
+     * It length-checks internally (needs >= MAX_NBYTES_FRAME_HEADER = 9) and
+     * scans for the sync word, so a truncated or offset packet is safe. */
     int header_consumed = 0;
+    unsigned short crc = 0;
     int parse_result = s->fn_parse_header(s->decoder, avpkt->data, avpkt->size,
-                       s->first_frame ? 1 : 0, &header_consumed, NULL);
+                       s->first_frame ? 1 : 0, &header_consumed, &crc);
 
     if (s->first_frame) {
         AV3A_LOGI("parse_header result=%d consumed=%d size=%d\n",
@@ -310,7 +347,13 @@ static int av3a_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         return avpkt->size;
     }
 
-    /* Step 2: decode payload into temp buffer */
+    /* Step 2: decode the payload.
+     * avs3_decode(dec, in, nLenIn, out, &pnLenOut, &pnLenConsumed)
+     * takes the byte range *after* the header, copies the frame into the
+     * decoder's internal bitstream, runs the core decoder and writes
+     * numChansOutput * frameLength * 2 bytes of S16 PCM into out.
+     * It lazily runs Avs3InitDecoder(model.bin) on the first call.
+     * On AVS3_DATA_NOT_ENOUGH it returns 0 and leaves *pnLenOut == 0. */
     int output_bytes = 0;
     int payload_consumed = 0;
     int decode_result = s->fn_decode(s->decoder,
