@@ -93,7 +93,7 @@
  * The previous version declared a 6-arg parse hook and a 6-arg decode hook and
  * pointed them at the *internal* symbols, whose signatures differ -- see the
  * long comment above. That mismatch is what corrupted memory. */
-typedef int   (*av3a_create_fn)(void);
+typedef void* (*av3a_create_fn)(void);
 typedef void  (*av3a_destroy_fn)(void*);
 /* int parse_header(void*, unsigned char* pData, int nLenIn, int isInitFrame,
  *                  int *pnLenConsumed, unsigned short *crc)                    */
